@@ -17,6 +17,8 @@ import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Flux;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/email")
@@ -96,13 +98,43 @@ public class EmailValidationController {
         return ResponseEntity.ok(results);
     }
 
+    // New async batch endpoint
+    @PostMapping("/batch-async")
+    public ResponseEntity<?> verifyBatchEmailsAsync(@RequestBody List<String> emails) {
+        if (emails == null || emails.isEmpty()) {
+            return ResponseEntity.badRequest().body(errorResponse("Email list must not be empty."));
+        }
+        List<CompletableFuture<EmailValidationResult>> futures = emails.stream()
+                .map(email -> mxLookupService.categorizeEmailAsync(email)
+                        .thenApply(result -> {
+                            saveVerificationResult(email, result);
+                            return result;
+                        })
+                        .exceptionally(ex -> {
+                            logger.warn("Failed to process email {}: {}", email, ex.getMessage(), ex);
+                            EmailValidationResult errorResult = new EmailValidationResult();
+                            errorResult.setEmail(email);
+                            errorResult.setCategory("Error");
+                            errorResult.setErrors(ex.getMessage());
+                            return errorResult;
+                        }))
+                .collect(Collectors.toList());
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+        List<EmailValidationResult> results = futures.stream()
+                .map(CompletableFuture::join)
+                .collect(Collectors.toList());
+
+        return ResponseEntity.ok(results);
+    }
+
     @PostMapping("/process-from-db")
     public ResponseEntity<?> processEmailsFromDb() {
         List<EmailEntity> emails = emailRepository.findAll();
         if (emails == null || emails.isEmpty()) {
             return ResponseEntity.ok(successResponse("No emails found to process."));
         }
-
         List<EmailValidationResult> results = new ArrayList<>();
         for (EmailEntity emailEntity : emails) {
             String email = emailEntity.getEmail();
