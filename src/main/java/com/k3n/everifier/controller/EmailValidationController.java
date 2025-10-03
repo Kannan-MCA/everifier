@@ -1,13 +1,8 @@
 package com.k3n.everifier.controller;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.k3n.everifier.dto.EmailValidationResult;
 import com.k3n.everifier.model.main.EmailEntity;
-import com.k3n.everifier.model.cache.EmailVerificationResultEntity;
-import com.k3n.everifier.repository.main.emailrepository;
-import com.k3n.everifier.repository.cache.emailverificationresultrepository;
-import com.k3n.everifier.services.MXLookupService;
+import com.k3n.everifier.services.EmailCacheService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -31,30 +26,24 @@ public class EmailValidationController {
 
     private static final Logger logger = LoggerFactory.getLogger(EmailValidationController.class);
 
-    private final MXLookupService mxLookupService;
-    private final ObjectMapper objectMapper;
-    private final emailrepository emailRepository;
-    private final emailverificationresultrepository resultRepository;
+    private final EmailCacheService emailCacheService;
     private final Executor taskExecutor;
+    private final com.k3n.everifier.repository.main.emailrepository emailRepository;
 
     @Autowired
-    public EmailValidationController(MXLookupService mxLookupService, ObjectMapper objectMapper,
-                                     emailrepository emailRepository,
-                                     emailverificationresultrepository resultRepository,
+    public EmailValidationController(EmailCacheService emailCacheService,
+                                     com.k3n.everifier.repository.main.emailrepository emailRepository,
                                      Executor taskExecutor) {
-        this.mxLookupService = mxLookupService;
-        this.objectMapper = objectMapper;
+        this.emailCacheService = emailCacheService;
         this.emailRepository = emailRepository;
-        this.resultRepository = resultRepository;
         this.taskExecutor = taskExecutor;
     }
 
-    /** Validate single email synchronously and save result */
+    /** Validate single email with cache TTL-aware */
     @GetMapping
     public ResponseEntity<?> verifySingleEmail(@RequestParam @NotEmpty @Email String email) {
         try {
-            EmailValidationResult result = mxLookupService.categorizeEmail(email);
-            saveVerificationResult(email, result);
+            EmailValidationResult result = emailCacheService.fetchValidationResult(email);
             return ResponseEntity.ok(result);
         } catch (Exception ex) {
             logger.error("Error verifying email {}: {}", email, ex.getMessage(), ex);
@@ -62,15 +51,13 @@ public class EmailValidationController {
         }
     }
 
-    /** Async batch validation endpoint with concurrency control */
+    /** Async batch validation endpoint with concurrency control using cache-aware fetch */
     @PostMapping("/batch-async")
     public ResponseEntity<?> verifyBatchEmailsAsync(@RequestBody @NotEmpty List<@Email String> emails) {
         List<CompletableFuture<EmailValidationResult>> futures = emails.stream()
                 .map(email -> CompletableFuture.supplyAsync(() -> {
                     try {
-                        EmailValidationResult result = mxLookupService.categorizeEmail(email);
-                        saveVerificationResult(email, result);
-                        return result;
+                        return emailCacheService.fetchValidationResult(email);
                     } catch (Exception ex) {
                         logger.warn("Failed to process email {}: {}", email, ex.getMessage(), ex);
                         EmailValidationResult errorResult = new EmailValidationResult();
@@ -89,7 +76,7 @@ public class EmailValidationController {
         return ResponseEntity.ok(results);
     }
 
-    /** Async processing of all emails fetched from DB with concurrency control */
+    /** Async processing of all emails fetched from DB with caching */
     @PostMapping("/process-from-db")
     public ResponseEntity<?> processEmailsFromDb() {
         List<EmailEntity> emails = emailRepository.findAll();
@@ -102,9 +89,7 @@ public class EmailValidationController {
             final String email = entity.getEmail();
             futures.add(CompletableFuture.supplyAsync(() -> {
                 try {
-                    EmailValidationResult result = mxLookupService.categorizeEmail(email);
-                    saveVerificationResult(email, result);
-                    return result;
+                    return emailCacheService.fetchValidationResult(email);
                 } catch (Exception ex) {
                     logger.warn("Failed to process email {}: {}", email, ex.getMessage(), ex);
                     EmailValidationResult errorResult = new EmailValidationResult();
@@ -121,23 +106,6 @@ public class EmailValidationController {
         List<EmailValidationResult> results = futures.stream().map(CompletableFuture::join).collect(Collectors.toList());
 
         return ResponseEntity.ok(results);
-    }
-
-    /** Save result in repository if not already present */
-    private void saveVerificationResult(String email, EmailValidationResult result) {
-        try {
-            if (resultRepository.findByEmail(email).isPresent()) {
-                logger.info("Skipping duplicate email: {}", email);
-                return;
-            }
-            String json = objectMapper.writeValueAsString(result);
-            EmailVerificationResultEntity entity = new EmailVerificationResultEntity();
-            entity.setEmail(email);
-            entity.setVerificationResultJson(json);
-            resultRepository.save(entity);
-        } catch (JsonProcessingException e) {
-            logger.error("Error serializing result for email {}: {}", email, e.getMessage(), e);
-        }
     }
 
     private static Map<String, String> singletonError(String message) {

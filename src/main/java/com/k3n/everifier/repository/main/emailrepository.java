@@ -7,7 +7,9 @@ import java.util.List;
 
 public interface emailrepository extends JpaRepository<EmailEntity, Long> {
 
+    // Find emails that have not been processed yet
     List<EmailEntity> findByProcessedFalse();
 
-
+    // Check if an email already exists in the primary database
+    boolean existsByEmail(String email);
 }
