@@ -7,8 +7,11 @@ WORKDIR /app
 # Copy the built jar file into the container
 COPY target/everifier-0.0.1-SNAPSHOT.jar app.jar
 
-# Expose Spring Boot default port
-EXPOSE 8080
+# Copy the JKS keystore file into the container
+COPY src/main/resources/yourkeystore.jks /app/yourkeystore.jks
+
+# Expose Spring Boot port
+EXPOSE 8081
 
 # Run the application
 ENTRYPOINT ["java", "-jar", "/app/app.jar"]

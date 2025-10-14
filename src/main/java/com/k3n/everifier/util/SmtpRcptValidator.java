@@ -102,14 +102,13 @@ public class SmtpRcptValidator {
             socket.setSoTimeout(timeoutMs);
 
             transcript.append(readAndLog(reader)).append('\n');
-            String ehloResponse = sendAndLog("EHLO syfer25.com", reader, writer);
+            String ehloResponse = sendAndLog("EHLO emailverification842@verifyapp.syfer25.com", reader, writer);
             transcript.append(ehloResponse).append('\n');
 
             if (ehloResponse.toLowerCase().contains("starttls")) {
                 tlsSupported = true;
                 transcript.append(sendAndLog("STARTTLS", reader, writer)).append('\n');
 
-                // Upgrade connection to TLS for remaining session
                 try (
                         SSLSocket tlsSocket = (SSLSocket) upgradeToTls(socket, mxHost);
                         BufferedReader tlsReader = new BufferedReader(new InputStreamReader(tlsSocket.getInputStream()));
@@ -120,8 +119,8 @@ public class SmtpRcptValidator {
                     transcript.append("<< TLS handshake successful\n");
                     transcript.append("<< TLS protocol: " + tlsSocket.getSession().getProtocol() + '\n');
                     transcript.append("<< TLS cipher suite: " + tlsSocket.getSession().getCipherSuite() + '\n');
-                    transcript.append(sendAndLog("EHLO syfer25.com", tlsReader, tlsWriter)).append('\n');
-                    transcript.append(sendAndLog("MAIL FROM:<validator@syfer25.com>", tlsReader, tlsWriter)).append('\n');
+                    transcript.append(sendAndLog("EHLO emailverification842@verifyapp.syfer25.com", tlsReader, tlsWriter)).append('\n');
+                    transcript.append(sendAndLog("MAIL FROM:<emailverification842@verifyapp.syfer25.com>", tlsReader, tlsWriter)).append('\n');
                     String rcptResponse = sendAndLog("RCPT TO:<" + email + ">", tlsReader, tlsWriter);
                     transcript.append(rcptResponse).append('\n');
 
@@ -142,7 +141,7 @@ public class SmtpRcptValidator {
                 }
             } else {
                 transcript.append(">> STARTTLS not supported by server\n");
-                transcript.append(sendAndLog("MAIL FROM:<validator@syfer25.com>", reader, writer)).append('\n');
+                transcript.append(sendAndLog("MAIL FROM:<emailverification842@verifyapp.syfer25.com>", reader, writer)).append('\n');
                 String rcptResponse = sendAndLog("RCPT TO:<" + email + ">", reader, writer);
                 transcript.append(rcptResponse).append('\n');
 
@@ -166,14 +165,6 @@ public class SmtpRcptValidator {
         }
     }
 
-    /**
-     * Checks if the domain acts as a catch-all by testing target and random recipient acceptance in a single SMTP session.
-     *
-     * @param mxHost MX host to connect for SMTP session (required, not null or empty)
-     * @param email  target email address to validate (required, not null or empty)
-     * @param domain domain for generating random catch-all test address (required, not null or empty)
-     * @return true if both target and random addresses are accepted, indicating catch-all; false otherwise
-     */
     public boolean checkSmtpCatchAllSingleSession(final String mxHost, final String email, final String domain) {
         if (mxHost == null || mxHost.trim().isEmpty()) {
             throw new IllegalArgumentException("mxHost must not be null or empty");
@@ -196,7 +187,7 @@ public class SmtpRcptValidator {
 
             readFullResponse(reader); // Server greeting
 
-            String ehloResponse = sendAndLog("EHLO syfer25.com", reader, writer);
+            String ehloResponse = sendAndLog("EHLO emailverification842@verifyapp.syfer25.com", reader, writer);
 
             boolean tlsSupported = ehloResponse.toLowerCase().contains("starttls");
             BufferedReader sessionReader = reader;
@@ -210,10 +201,10 @@ public class SmtpRcptValidator {
                 sessionReader = new BufferedReader(new InputStreamReader(tlsSocket.getInputStream()));
                 sessionWriter = new PrintWriter(tlsSocket.getOutputStream(), true);
                 sessionSocket = tlsSocket;
-                sendAndLog("EHLO syfer25.com", sessionReader, sessionWriter);
+                sendAndLog("EHLO emailverification842@verifyapp.syfer25.com", sessionReader, sessionWriter);
             }
 
-            sendAndLog("MAIL FROM:<validator@syfer25.com>", sessionReader, sessionWriter);
+            sendAndLog("MAIL FROM:<emailverification842@verifyapp.syfer25.com>", sessionReader, sessionWriter);
 
             String rcptResponseTarget = sendAndLog("RCPT TO:<" + email + ">", sessionReader, sessionWriter);
             int codeTarget = parseSmtpCode(rcptResponseTarget);
@@ -237,7 +228,8 @@ public class SmtpRcptValidator {
         final SSLSocketFactory sslSocketFactory = (SSLSocketFactory) SSLSocketFactory.getDefault();
         final SSLSocket sslSocket = (SSLSocket) sslSocketFactory.createSocket(
                 plainSocket, mxHost, plainSocket.getPort(), true);
-        sslSocket.setEnabledProtocols(new String[] {"TLSv1.2"});
+        // Enable TLSv1.3 and TLSv1.2 protocols
+        sslSocket.setEnabledProtocols(new String[] {"TLSv1.3", "TLSv1.2"});
         sslSocket.startHandshake();
         return sslSocket;
     }
