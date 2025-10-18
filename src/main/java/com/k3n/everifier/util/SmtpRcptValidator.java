@@ -22,7 +22,7 @@ public class SmtpRcptValidator {
     @Value("${smtp.timeout.ms:15000}")
     private int timeoutMs;
 
-    private static final int[] SMTP_PORTS = {25, 465, 587, 2525, 2465, 5870};
+    private static final int[] SMTP_PORTS = {465, 587, 2525, 2465, 5870, 25};
 
     static {
         System.setProperty("java.net.preferIPv4Stack", "true");

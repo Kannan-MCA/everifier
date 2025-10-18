@@ -211,7 +211,8 @@ public class MXLookupService {
             attempt++;
             try {
                 Thread.sleep(1000 * attempt);
-            } catch (InterruptedException ignored) { }
+            } catch (InterruptedException ignored) {
+            }
         }
         return result;
     }
@@ -294,23 +295,33 @@ public class MXLookupService {
 
     public boolean isCatchAll(final List<String> mxRecords, final String domain) throws IOException {
         if (mxRecords == null || mxRecords.isEmpty()) return false;
-        final String mxHost = extractMxHost(mxRecords.get(0));
 
-        String[] testEmails = {
-                "nonexistent1@" + domain,
-                "nonexistent2@" + domain,
-                "nonexistent3@" + domain
-        };
+        for (String mxRecord : mxRecords) {
+            final String mxHost = extractMxHost(mxRecord);
 
-        int acceptedCount = 0;
-        for (String testEmail : testEmails) {
-            if (smtpRcptValidator.checkSmtpCatchAllSingleSession(mxHost, testEmail, domain)) {
-                acceptedCount++;
+            int acceptedForMx = 0;
+            int testCount = 5;
+
+            for (int i = 0; i < testCount; i++) {
+                String testEmail = generateRandomEmail(domain);
+                if (smtpRcptValidator.checkSmtpCatchAllSingleSession(mxHost, testEmail, domain)) {
+                    acceptedForMx++;
+                }
+            }
+
+            // If any MX rejects at least one test email, not catch-all
+            if (acceptedForMx < testCount) {
+                return false;
             }
         }
 
-        // Consider catch-all if 80% or more test addresses are accepted
-        return acceptedCount >= testEmails.length * 0.8;
+        // All MXs accepted all test emails: catch-all domain
+        return true;
+    }
+
+    private String generateRandomEmail(String domain) {
+        String randomStr = UUID.randomUUID().toString().replace("-", "");
+        return randomStr + "@" + domain;
     }
 
     private String extractMxHost(final String mxRecord) {
