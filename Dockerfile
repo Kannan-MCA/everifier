@@ -8,7 +8,7 @@ WORKDIR /app
 COPY target/everifier-0.0.1-SNAPSHOT.jar app.jar
 
 # Expose Spring Boot default port
-EXPOSE 8080
+EXPOSE 8081
 
 # Run the application
 ENTRYPOINT ["java", "-jar", "/app/app.jar"]
