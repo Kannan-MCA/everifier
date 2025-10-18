@@ -65,20 +65,17 @@ public class MXLookupService {
         result.setTimestamp(java.time.LocalDateTime.now().format(
                 java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS")));
 
-        // Step 1: Syntax validation
         if (!isValidEmail(email)) {
             result.setCategory("Invalid");
             return result;
         }
 
-        // Extract domain
         String domain = extractDomain(email);
         if (domain == null) {
             result.setCategory("Invalid");
             return result;
         }
 
-        // Step 2: Domain whitelist/blacklist/disposable checks
         if (isWhitelistedDomain(domain)) {
             result.setCategory("Whitelisted");
             return result;
@@ -92,7 +89,6 @@ public class MXLookupService {
             return result;
         }
 
-        // Step 3: DNS MX record lookup
         List<String> mxRecords;
         try {
             mxRecords = getMXRecords(domain);
@@ -101,12 +97,12 @@ public class MXLookupService {
                 return result;
             }
         } catch (NamingException e) {
+            logger.warn("MX lookup failed for domain {}: {}", domain, e.getMessage());
             result.setCategory("Unknown");
-            result.setErrors(e.getMessage());
+            result.setErrors("MX lookup error: " + e.getMessage());
             return result;
         }
 
-        // Step 4: Catch-All detection
         try {
             if (isCatchAll(mxRecords, domain)) {
                 result.setCategory("Catch-All");
@@ -114,28 +110,19 @@ public class MXLookupService {
                 return result;
             }
         } catch (IOException e) {
+            logger.warn("Catch-All detection failed for domain {}: {}", domain, e.getMessage());
             result.setCategory("Unknown");
-            result.setErrors(e.getMessage());
+            result.setErrors("Catch-All detection error: " + e.getMessage());
             return result;
         }
 
-        // Step 5: SMTP Recipient Validation + TLS support (existing logic)
-        ValidationResult smtp;
-        try {
-            smtp = smtpCheckStatus(mxRecords, email);
-        } catch (Exception ex) {
-            logger.warn("SMTP validation failed for email {}: {}", email, ex.getMessage(), ex);
-            // Fallback: mark as unknown with error
-            result.setCategory("Unknown");
-            result.setErrors("SMTP validation failed: " + ex.getMessage());
-            return result;
-        }
+        ValidationResult smtp = smtpCheckStatusWithRetry(mxRecords, email, 2);
         if (smtp == null) {
             result.setCategory("Unknown");
+            result.setErrors("SMTP validation returned no result");
             return result;
         }
 
-        // Step 6: Handle blacklist SMTP errors explicitly
         String errorMsg = smtp.getErrorMessage() != null ? smtp.getErrorMessage().toLowerCase() : "";
         if (errorMsg.contains("550 5.7.1") || errorMsg.contains("blocked") || errorMsg.contains("spamhaus")) {
             result.setCategory("Blacklisted");
@@ -143,7 +130,6 @@ public class MXLookupService {
             return result;
         }
 
-        // Set detailed SMTP result fields
         result.setDiagnosticTag(smtp.getDiagnosticTag());
         result.setSmtpCode(smtp.getSmtpCode());
         result.setStatus(smtp.getStatus() != null ? smtp.getStatus().name() : null);
@@ -158,7 +144,6 @@ public class MXLookupService {
             result.setErrors(smtp.getErrorMessage());
         }
 
-        // Step 7: Categorize based on SMTP diagnosticTag
         String tag = smtp.getDiagnosticTag() != null ? smtp.getDiagnosticTag().trim() : "";
         switch (tag) {
             case "Accepted":
@@ -207,10 +192,29 @@ public class MXLookupService {
                         smtp.getStatus() == SmtpRecipientStatus.TemporaryFailure ? "Unknown" : "Invalid"
                 );
         }
-
         return result;
     }
 
+    private ValidationResult smtpCheckStatusWithRetry(final List<String> mxRecords, final String email, int maxRetries) {
+        int attempt = 0;
+        ValidationResult result = null;
+        String mxHost = extractMxHost(mxRecords.get(0));
+        while (attempt < maxRetries) {
+            try {
+                result = smtpRcptValidator.validateRecipient(mxHost, email);
+                if (result != null && result.getStatus() != SmtpRecipientStatus.TemporaryFailure) {
+                    return result;
+                }
+            } catch (Exception e) {
+                logger.warn("SMTP validation attempt {} for {} failed: {}", attempt + 1, email, e.getMessage());
+            }
+            attempt++;
+            try {
+                Thread.sleep(1000 * attempt);
+            } catch (InterruptedException ignored) { }
+        }
+        return result;
+    }
 
     public boolean isValidEmail(final String email) {
         return email != null && EMAIL_PATTERN.matcher(email).matches();
@@ -218,14 +222,14 @@ public class MXLookupService {
 
     public String extractDomain(final String email) {
         if (email == null) return null;
-        final int atIndex = email.lastIndexOf('@');
+        int atIndex = email.lastIndexOf('@');
         if (atIndex < 0 || atIndex == email.length() - 1) return null;
         String domain = email.substring(atIndex + 1).toLowerCase(Locale.ROOT);
-
         try {
             domain = IDN.toASCII(domain);
-        } catch (Exception ignore) {}
-
+        } catch (Exception ex) {
+            // ignore fallback
+        }
         return domain;
     }
 
@@ -266,7 +270,7 @@ public class MXLookupService {
                     .collect(Collectors.toList());
         }
 
-        List<String> mxRecords = IntStream.range(0, attr.size())
+        return IntStream.range(0, attr.size())
                 .mapToObj(i -> {
                     try {
                         return attr.get(i).toString();
@@ -277,8 +281,6 @@ public class MXLookupService {
                 .filter(s -> !s.isEmpty())
                 .sorted(Comparator.comparingInt(this::parsePriority))
                 .collect(Collectors.toList());
-
-        return mxRecords;
     }
 
     private int parsePriority(final String mxRecord) {
@@ -294,12 +296,6 @@ public class MXLookupService {
         if (mxRecords == null || mxRecords.isEmpty()) return false;
         final String mxHost = extractMxHost(mxRecords.get(0));
         return smtpRcptValidator.checkSmtpCatchAllSingleSession(mxHost, "nonexistent@" + domain, domain);
-    }
-
-    private ValidationResult smtpCheckStatus(final List<String> mxRecords, final String email) {
-        if (mxRecords == null || mxRecords.isEmpty()) return null;
-        String mxHost = extractMxHost(mxRecords.get(0));
-        return smtpRcptValidator.validateRecipient(mxHost, email);
     }
 
     private String extractMxHost(final String mxRecord) {
