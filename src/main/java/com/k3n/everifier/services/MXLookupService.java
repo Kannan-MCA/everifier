@@ -103,20 +103,8 @@ public class MXLookupService {
             return result;
         }
 
-        try {
-            if (isCatchAll(mxRecords, domain)) {
-                result.setCategory("Catch-All");
-                result.setCatchAll(true);
-                return result;
-            }
-        } catch (IOException e) {
-            logger.warn("Catch-All detection failed for domain {}: {}", domain, e.getMessage());
-            result.setCategory("Unknown");
-            result.setErrors("Catch-All detection error: " + e.getMessage());
-            return result;
-        }
-
         ValidationResult smtp = smtpCheckStatusWithRetry(mxRecords, email, 2);
+
         if (smtp == null) {
             result.setCategory("Unknown");
             result.setErrors("SMTP validation returned no result");
@@ -130,6 +118,22 @@ public class MXLookupService {
             return result;
         }
 
+        boolean isCatchAll = false;
+        try {
+            isCatchAll = isCatchAll(mxRecords, domain);
+        } catch (IOException e) {
+            logger.warn("Catch-All detection failed for domain {}: {}", domain, e.getMessage());
+            result.setCategory("Unknown");
+            result.setErrors("Catch-All detection error: " + e.getMessage());
+            return result;
+        }
+
+        if (isCatchAll) {
+            result.setCategory("Catch-All");
+            result.setCatchAll(true);
+            return result;
+        }
+
         result.setDiagnosticTag(smtp.getDiagnosticTag());
         result.setSmtpCode(smtp.getSmtpCode());
         result.setStatus(smtp.getStatus() != null ? smtp.getStatus().name() : null);
@@ -140,6 +144,7 @@ public class MXLookupService {
         result.setConnectionSuccessful(
                 smtp.getStatus() != null && !smtp.getStatus().equals(SmtpRecipientStatus.UnknownFailure)
         );
+
         if (smtp.getErrorMessage() != null) {
             result.setErrors(smtp.getErrorMessage());
         }
@@ -201,7 +206,7 @@ public class MXLookupService {
         String mxHost = extractMxHost(mxRecords.get(0));
         while (attempt < maxRetries) {
             try {
-                result = smtpRcptValidator.validateRecipient(mxHost, email);
+                result = smtpRcptValidator.validateRecipient(email);
                 if (result != null && result.getStatus() != SmtpRecipientStatus.TemporaryFailure) {
                     return result;
                 }

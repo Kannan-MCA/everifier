@@ -1,39 +1,49 @@
 package com.k3n.everifier.util;
 
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Scope;
-import org.springframework.stereotype.Component;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
 
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
-import java.io.*;
-import java.net.*;
+import javax.naming.directory.InitialDirContext;
+import javax.naming.directory.Attributes;
+import javax.naming.directory.Attribute;
+import javax.naming.NamingException;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.Arrays;
-import java.util.List;
+
 import java.util.concurrent.*;
-import java.util.stream.Collectors;
 
 @Component
-@Scope("prototype")
 public class SmtpRcptValidator {
 
     private static final Logger logger = LoggerFactory.getLogger(SmtpRcptValidator.class);
 
-    @Value("${smtp.timeout.ms:15000}")
-    private int timeoutMs;
-
+    private static final int TIMEOUT_MS = 15000; // 15 seconds timeout
     private static final int[] SMTP_PORTS = {25, 587, 465};
 
-    static {
-        System.setProperty("java.net.preferIPv4Stack", "true");
+    public boolean checkSmtpCatchAllSingleSession(String mxHost, String testEmail, String domain) {
+        try {
+            ValidationResult result = validateRecipient(testEmail);
+            // Assuming if the result status is Valid, it's a catch-all
+            return result != null && result.getStatus() == SmtpRecipientStatus.Valid;
+        } catch (IOException e) {
+            // Log or handle as needed
+            return false;
+        }
     }
 
     public enum SmtpRecipientStatus {
-        Valid, UserNotFound, TemporaryFailure, UnknownFailure, Blacklisted
+        Valid, UserNotFound, TemporaryFailure, UnknownFailure, Blacklisted, UncertainDueToCatchAll, InvalidFormat, NoMxRecord
     }
 
     public static class ValidationResult {
@@ -45,13 +55,28 @@ public class SmtpRcptValidator {
         private final String fullTranscript;
         private final String timestamp;
         private final String diagnosticTag;
+
+        public boolean isTlsSupported() {
+            return tlsSupported;
+        }
+
+        public boolean isCatchAllDomain() {
+            return isCatchAllDomain;
+        }
+
         private final boolean tlsSupported;
+
+        public int getPortUsed() {
+            return portUsed;
+        }
+
         private final int portUsed;
+        private final boolean isCatchAllDomain;
 
         public ValidationResult(SmtpRecipientStatus status, int smtpCode, String smtpResponse,
                                 String errorMessage, String mxHost, String fullTranscript,
                                 String timestamp, String diagnosticTag,
-                                boolean tlsSupported, int portUsed) {
+                                boolean tlsSupported, int portUsed, boolean isCatchAllDomain) {
             this.status = status;
             this.smtpCode = smtpCode;
             this.smtpResponse = smtpResponse;
@@ -62,120 +87,68 @@ public class SmtpRcptValidator {
             this.diagnosticTag = diagnosticTag;
             this.tlsSupported = tlsSupported;
             this.portUsed = portUsed;
+            this.isCatchAllDomain = isCatchAllDomain;
         }
 
-        public SmtpRecipientStatus getStatus() {
-            return status;
+        public SmtpRecipientStatus getStatus() { return status; }
+        public int getSmtpCode() { return smtpCode; }
+        public String getSmtpResponse() { return smtpResponse; }
+        public String getErrorMessage() { return errorMessage; }
+        public String getMxHost() { return mxHost; }
+        public String getFullTranscript() { return fullTranscript; }
+        public String getTimestamp() { return timestamp; }
+        public String getDiagnosticTag() { return diagnosticTag; }
+    }
+
+    public ValidationResult validateRecipient(String email) throws IOException {
+        if (email == null || !email.contains("@")) {
+            return new ValidationResult(SmtpRecipientStatus.InvalidFormat, -1, null,
+                    "Invalid email format", null, "", LocalDateTime.now().toString(),
+                    "InvalidFormat", false, -1, false);
         }
 
-        public int getSmtpCode() {
-            return smtpCode;
+        String domain = email.substring(email.indexOf('@') + 1);
+
+        String mxHost;
+        InetAddress inetAddress;
+        try {
+            mxHost = resolveMxHostOrThrow(domain);
+            inetAddress = InetAddress.getByName(mxHost);
+            logger.info("Resolved MX host {} to IP {}", mxHost, inetAddress.getHostAddress());
+        } catch (IOException e) {
+            return new ValidationResult(SmtpRecipientStatus.NoMxRecord, -1, null,
+                    "MX lookup failed: " + e.getMessage(), domain, "", LocalDateTime.now().toString(),
+                    "NoMxRecord", false, -1, false);
         }
 
-        public String getSmtpResponse() {
-            return smtpResponse;
-        }
-
-        public String getErrorMessage() {
-            return errorMessage;
-        }
-
-        public String getMxHost() {
-            return mxHost;
-        }
-
-        public String getFullTranscript() {
-            return fullTranscript;
-        }
-
-        public String getTimestamp() {
-            return timestamp;
-        }
-
-        public String getDiagnosticTag() {
-            return diagnosticTag;
-        }
-
-        public boolean isTlsSupported() {
-            return tlsSupported;
-        }
-
-        public int getPortUsed() {
-            return portUsed;
+        ParallelPortChecker portChecker = new ParallelPortChecker(SMTP_PORTS, port -> attemptValidation(inetAddress, mxHost, email, port));
+        try {
+            return portChecker.checkAllPorts();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new ValidationResult(SmtpRecipientStatus.UnknownFailure, -1, "Validation interrupted",
+                    "Interrupted", mxHost, "", LocalDateTime.now().toString(),
+                    "Interrupted", false, -1, false);
         }
     }
 
-    public ValidationResult validateRecipient(String mxHost, String email) {
-        InetAddress inetAddress;
+    private String resolveMxHostOrThrow(String domain) throws IOException {
         try {
-            inetAddress = InetAddress.getByName(mxHost);
-            logger.info("Resolved MX host {} to IP {}", mxHost, inetAddress.getHostAddress());
-        } catch (UnknownHostException e) {
-            logger.error("DNS resolution failed for {}: {}", mxHost, e.getMessage());
-            return new ValidationResult(
-                    SmtpRecipientStatus.UnknownFailure, -1, null,
-                    "DNS resolution failed: " + e.getMessage(),
-                    mxHost, "", LocalDateTime.now().toString(), "DNSResolutionFailed", false, -1);
+            InitialDirContext iDirContext = new InitialDirContext();
+            Attributes attributes = iDirContext.getAttributes("dns:/" + domain, new String[]{"MX"});
+            Attribute attribute = attributes.get("MX");
+            if (attribute == null) {
+                throw new IOException("No MX records for domain " + domain);
+            }
+            String mxRecord = (String) attribute.get(0);
+            String mxHost = mxRecord.substring(mxRecord.indexOf(' ') + 1).trim();
+            if (mxHost.endsWith(".")) {
+                mxHost = mxHost.substring(0, mxHost.length() - 1);
+            }
+            return mxHost;
+        } catch (NamingException e) {
+            throw new IOException("MX lookup failed: " + e.getMessage(), e);
         }
-
-        ExecutorService executor = Executors.newFixedThreadPool(SMTP_PORTS.length);
-        List<Future<ValidationResult>> futures = null;
-        try {
-            futures = Arrays.stream(SMTP_PORTS)
-                    .mapToObj(port -> executor.submit(() -> {
-                        try {
-                            return attemptValidation(inetAddress, mxHost, email, port);
-                        } catch (IOException e) {
-                            logger.warn("Port {} failed: {}", port, e.getMessage());
-                            return new ValidationResult(
-                                    SmtpRecipientStatus.UnknownFailure, -1, e.getMessage(),
-                                    "Port validation failed", mxHost, "", LocalDateTime.now().toString(),
-                                    "PortFailed", false, port);
-                        }
-                    }))
-                    .collect(Collectors.toList());
-
-            for (Future<ValidationResult> future : futures) {
-                try {
-                    ValidationResult result = future.get();
-                    if (result.getStatus() == SmtpRecipientStatus.Valid) {
-                        // Cancel other tasks
-                        for (Future<ValidationResult> f : futures) {
-                            if (!f.isDone()) {
-                                f.cancel(true);
-                            }
-                        }
-                        return result;
-                    }
-                } catch (CancellationException e) {
-                    // Ignored - task was cancelled
-                } catch (Exception e) {
-                    logger.error("Exception during validation execution: {}", e.getMessage());
-                }
-            }
-
-            // No success; return first failure or UnknownFailure if none found
-            for (Future<ValidationResult> future : futures) {
-                if (future.isDone() && !future.isCancelled()) {
-                    try {
-                        ValidationResult res = future.get();
-                        if (res != null) {
-                            return res;
-                        }
-                    } catch (Exception e) {
-                        // ignore exceptions here
-                    }
-                }
-            }
-        } finally {
-            if (executor != null) {
-                executor.shutdownNow();
-            }
-        }
-
-        return new ValidationResult(
-                SmtpRecipientStatus.UnknownFailure, -1, "All ports failed", "No successful validation",
-                mxHost, "", LocalDateTime.now().toString(), "AllPortsFailed", false, -1);
     }
 
     private ValidationResult attemptValidation(InetAddress inetAddress, String mxHost, String email, int port) throws IOException {
@@ -189,12 +162,12 @@ public class SmtpRcptValidator {
                 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                 PrintWriter writer = new PrintWriter(socket.getOutputStream(), true)
         ) {
-            transcript.append(readAndLog(reader)).append('\n');
+            transcript.append(readFullResponse(reader)).append('\n');
 
             boolean implicitTls = (port == 465 || port == 2465);
 
             if (!implicitTls) {
-                String ehloResponse = sendAndLog("EHLO syfer25.com", reader, writer);
+                String ehloResponse = sendAndLog("EHLO validator.com", reader, writer);
                 transcript.append(ehloResponse).append('\n');
 
                 if (ehloResponse.toLowerCase().contains("starttls")) {
@@ -207,63 +180,62 @@ public class SmtpRcptValidator {
                             PrintWriter tlsWriter = new PrintWriter(tlsSocket.getOutputStream(), true)
                     ) {
                         tlsSocket.setEnabledProtocols(tlsSocket.getSupportedProtocols());
-                        tlsSocket.setSoTimeout(timeoutMs);
+                        tlsSocket.setSoTimeout(TIMEOUT_MS);
 
                         transcript.append("<< TLS handshake successful\n");
 
-                        transcript.append(sendAndLog("EHLO syfer25.com", tlsReader, tlsWriter)).append('\n');
-                        transcript.append(sendAndLog("MAIL FROM:<validator@syfer25.com>", tlsReader, tlsWriter)).append('\n');
+                        transcript.append(sendAndLog("EHLO validator.com", tlsReader, tlsWriter)).append('\n');
+                        transcript.append(sendAndLog("MAIL FROM:<validator@validator.com>", tlsReader, tlsWriter)).append('\n');
 
                         String rcptResponse = sendAndLog("RCPT TO:<" + email + ">", tlsReader, tlsWriter);
                         transcript.append(rcptResponse).append('\n');
 
                         int code = parseSmtpCode(rcptResponse);
-                        SmtpRecipientStatus status = classifyResponse(code, rcptResponse);
-                        String tag = generateDiagnosticTag(code, rcptResponse);
-
+                        String enhancedCode = parseEnhancedSmtpCode(rcptResponse);
+                        SmtpRecipientStatus status = SmtpResponseClassifier.classifyResponse(code, enhancedCode, rcptResponse);
+                        String tag = SmtpResponseClassifier.generateDiagnosticTag(code, rcptResponse);
                         return new ValidationResult(status, code, rcptResponse, null, mxHost,
-                                transcript.toString().trim(), timestamp, tag, tlsSupported, port);
+                                transcript.toString().trim(), timestamp, tag, tlsSupported, port, false);
                     }
                 }
             }
 
             if (implicitTls) {
                 transcript.append("<< Implicit TLS connection established\n");
-
-                // Send EHLO after implicit TLS handshake, before MAIL FROM
-                String ehloResponse = sendAndLog("EHLO syfer25.com", reader, writer);
+                String ehloResponse = sendAndLog("EHLO validator.com", reader, writer);
                 transcript.append(ehloResponse).append('\n');
             }
 
-            transcript.append(sendAndLog("MAIL FROM:<validator@syfer25.com>", reader, writer)).append('\n');
+            transcript.append(sendAndLog("MAIL FROM:<validator@validator.com>", reader, writer)).append('\n');
             String rcptResponse = sendAndLog("RCPT TO:<" + email + ">", reader, writer);
             int code = parseSmtpCode(rcptResponse);
-            SmtpRecipientStatus status = classifyResponse(code, rcptResponse);
-            String tag = generateDiagnosticTag(code, rcptResponse);
+            String enhancedCode = parseEnhancedSmtpCode(rcptResponse);
+            SmtpRecipientStatus status = SmtpResponseClassifier.classifyResponse(code, enhancedCode, rcptResponse);
+            String tag = SmtpResponseClassifier.generateDiagnosticTag(code, rcptResponse);
 
             return new ValidationResult(status, code, rcptResponse, null, mxHost,
-                    transcript.toString().trim(), timestamp, tag, tlsSupported || implicitTls, port);
+                    transcript.toString().trim(), timestamp, tag, tlsSupported || implicitTls, port, false);
 
-        } catch (SocketTimeoutException e) {
-            throw new IOException("Timeout on port " + port + ": " + e.getMessage(), e);
+        } catch (IOException e) {
+            throw e;
         }
     }
 
     private Socket openSocket(InetAddress inetAddress, int port) throws IOException {
-        Socket socket;
         if (port == 465 || port == 2465) {
             SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
-            socket = factory.createSocket(inetAddress, port);
-            ((SSLSocket) socket).setEnabledProtocols(((SSLSocket) socket).getSupportedProtocols());
+            SSLSocket socket = (SSLSocket) factory.createSocket(inetAddress, port);
+            socket.setEnabledProtocols(socket.getSupportedProtocols());
+            socket.setSoTimeout(TIMEOUT_MS);
+            return socket;
         } else {
-            SocketAddress sockaddr = new InetSocketAddress(inetAddress, port);
-            socket = new Socket();
+            Socket socket = new Socket();
             socket.setReuseAddress(true);
             socket.setKeepAlive(true);
-            socket.connect(sockaddr, timeoutMs);
+            socket.connect(new InetSocketAddress(inetAddress, port), TIMEOUT_MS);
+            socket.setSoTimeout(TIMEOUT_MS);
+            return socket;
         }
-        socket.setSoTimeout(timeoutMs);
-        return socket;
     }
 
     private Socket upgradeToTls(Socket plainSocket, String mxHost) throws IOException {
@@ -281,11 +253,6 @@ public class SmtpRcptValidator {
         return ">> " + command + "\n<< " + response;
     }
 
-    private String readAndLog(BufferedReader reader) throws IOException {
-        String response = readFullResponse(reader);
-        return "<< " + response;
-    }
-
     private String readFullResponse(BufferedReader reader) throws IOException {
         StringBuilder response = new StringBuilder();
         String line;
@@ -296,7 +263,7 @@ public class SmtpRcptValidator {
         return response.toString().trim();
     }
 
-    private int parseSmtpCode(final String response) {
+    private int parseSmtpCode(String response) {
         if (response == null || response.length() < 3) return -1;
         String[] lines = response.split("\n");
         String last = lines[lines.length - 1].trim();
@@ -308,38 +275,15 @@ public class SmtpRcptValidator {
         }
     }
 
-    private SmtpRecipientStatus classifyResponse(int code, String response) {
-        String lower = response != null ? response.toLowerCase() : "";
-        if (code >= 250 && code <= 259) return SmtpRecipientStatus.Valid;
-        if (code == 252 || (code >= 400 && code < 500)) return SmtpRecipientStatus.TemporaryFailure;
-        if (code == 550 || lower.contains("user unknown") || lower.contains("no such user"))
-            return SmtpRecipientStatus.UserNotFound;
-        if (lower.contains("blacklist") || lower.contains("spamhaus") || lower.contains("blocked"))
-            return SmtpRecipientStatus.Blacklisted;
-        return SmtpRecipientStatus.UnknownFailure;
-    }
-
-    private String generateDiagnosticTag(int code, String response) {
-        if (code == 250) return "Accepted";
-        if (code == 550) return "UserNotFound";
-        if (code == 554) return "Rejected";
-        if (code == 451) return "Temporary";
-        if (response != null && response.toLowerCase().contains("blacklist")) return "BlockedByBlacklist";
-        return "Unclassified";
-    }
-
-    private String getStackTrace(Throwable throwable) {
-        StringWriter sw = new StringWriter();
-        PrintWriter pw = new PrintWriter(sw);
-        throwable.printStackTrace(pw);
-        return sw.toString();
-    }
-
-    /**
-     * Check catch-all by sending RCPT TO for a guaranteed non-existing address.
-     */
-    public boolean checkSmtpCatchAllSingleSession(String mxHost, String testEmail, String domain) throws IOException {
-        ValidationResult result = validateRecipient(mxHost, testEmail);
-        return result != null && result.getStatus() == SmtpRecipientStatus.Valid;
+    private String parseEnhancedSmtpCode(String response) {
+        if (response == null) return "";
+        String[] lines = response.split("\n");
+        String last = lines[lines.length - 1].trim();
+        if (last.startsWith("<< ")) last = last.substring(3).trim();
+        String[] parts = last.split(" ");
+        if (parts.length >= 2 && parts[1].matches("\\d\\.\\d\\.\\d")) {
+            return parts[1];
+        }
+        return "";
     }
 }
