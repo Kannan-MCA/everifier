@@ -12,6 +12,10 @@ import java.io.*;
 import java.net.*;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 @Component
 @Scope("prototype")
@@ -22,7 +26,7 @@ public class SmtpRcptValidator {
     @Value("${smtp.timeout.ms:15000}")
     private int timeoutMs;
 
-    private static final int[] SMTP_PORTS = {465, 587, 2525, 2465, 5870, 25};
+    private static final int[] SMTP_PORTS = {25, 587, 465};
 
     static {
         System.setProperty("java.net.preferIPv4Stack", "true");
@@ -114,18 +118,64 @@ public class SmtpRcptValidator {
                     mxHost, "", LocalDateTime.now().toString(), "DNSResolutionFailed", false, -1);
         }
 
-        for (int port : SMTP_PORTS) {
-            try {
-                logger.info("Attempting validation on {}:{} ...", mxHost, port);
-                return attemptValidation(inetAddress, mxHost, email, port);
-            } catch (Exception e) {
-                logger.warn("Validation failed on port {} ({}): {}", port, mxHost, getStackTrace(e));
+        ExecutorService executor = Executors.newFixedThreadPool(SMTP_PORTS.length);
+        List<Future<ValidationResult>> futures = null;
+        try {
+            futures = Arrays.stream(SMTP_PORTS)
+                    .mapToObj(port -> executor.submit(() -> {
+                        try {
+                            return attemptValidation(inetAddress, mxHost, email, port);
+                        } catch (IOException e) {
+                            logger.warn("Port {} failed: {}", port, e.getMessage());
+                            return new ValidationResult(
+                                    SmtpRecipientStatus.UnknownFailure, -1, e.getMessage(),
+                                    "Port validation failed", mxHost, "", LocalDateTime.now().toString(),
+                                    "PortFailed", false, port);
+                        }
+                    }))
+                    .collect(Collectors.toList());
+
+            for (Future<ValidationResult> future : futures) {
+                try {
+                    ValidationResult result = future.get();
+                    if (result.getStatus() == SmtpRecipientStatus.Valid) {
+                        // Cancel other tasks
+                        for (Future<ValidationResult> f : futures) {
+                            if (!f.isDone()) {
+                                f.cancel(true);
+                            }
+                        }
+                        return result;
+                    }
+                } catch (CancellationException e) {
+                    // Ignored - task was cancelled
+                } catch (Exception e) {
+                    logger.error("Exception during validation execution: {}", e.getMessage());
+                }
+            }
+
+            // No success; return first failure or UnknownFailure if none found
+            for (Future<ValidationResult> future : futures) {
+                if (future.isDone() && !future.isCancelled()) {
+                    try {
+                        ValidationResult res = future.get();
+                        if (res != null) {
+                            return res;
+                        }
+                    } catch (Exception e) {
+                        // ignore exceptions here
+                    }
+                }
+            }
+        } finally {
+            if (executor != null) {
+                executor.shutdownNow();
             }
         }
+
         return new ValidationResult(
-                SmtpRecipientStatus.UnknownFailure, -1, "No response", "All ports failed",
-                mxHost, "", LocalDateTime.now().toString(), "PortScanFailed", false, -1
-        );
+                SmtpRecipientStatus.UnknownFailure, -1, "All ports failed", "No successful validation",
+                mxHost, "", LocalDateTime.now().toString(), "AllPortsFailed", false, -1);
     }
 
     private ValidationResult attemptValidation(InetAddress inetAddress, String mxHost, String email, int port) throws IOException {

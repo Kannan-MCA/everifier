@@ -296,7 +296,15 @@ public class MXLookupService {
     public boolean isCatchAll(final List<String> mxRecords, final String domain) throws IOException {
         if (mxRecords == null || mxRecords.isEmpty()) return false;
 
-        for (String mxRecord : mxRecords) {
+        int lowestPriority = mxRecords.stream()
+                .mapToInt(this::parsePriority)
+                .min().orElse(Integer.MAX_VALUE);
+
+        List<String> lowestPriorityMxRecords = mxRecords.stream()
+                .filter(mx -> parsePriority(mx) == lowestPriority)
+                .collect(Collectors.toList());
+
+        for (String mxRecord : lowestPriorityMxRecords) {
             final String mxHost = extractMxHost(mxRecord);
 
             int acceptedForMx = 0;
@@ -309,13 +317,11 @@ public class MXLookupService {
                 }
             }
 
-            // If any MX rejects at least one test email, not catch-all
             if (acceptedForMx < testCount) {
                 return false;
             }
         }
 
-        // All MXs accepted all test emails: catch-all domain
         return true;
     }
 
