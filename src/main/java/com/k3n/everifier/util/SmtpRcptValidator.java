@@ -21,29 +21,18 @@ import java.net.Socket;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
-import java.util.concurrent.*;
-
 @Component
 public class SmtpRcptValidator {
 
     private static final Logger logger = LoggerFactory.getLogger(SmtpRcptValidator.class);
 
-    private static final int TIMEOUT_MS = 15000; // 15 seconds timeout
+    private static final int CONNECT_TIMEOUT_MS = 10000;    // 10 seconds connection timeout
+    private static final int READ_TIMEOUT_MS = 15000;       // 15 seconds socket timeout
     private static final int[] SMTP_PORTS = {25, 587, 465};
 
-    public boolean checkSmtpCatchAllSingleSession(String mxHost, String testEmail, String domain) {
-        try {
-            ValidationResult result = validateRecipient(testEmail);
-            // Assuming if the result status is Valid, it's a catch-all
-            return result != null && result.getStatus() == SmtpRecipientStatus.Valid;
-        } catch (IOException e) {
-            // Log or handle as needed
-            return false;
-        }
-    }
-
     public enum SmtpRecipientStatus {
-        Valid, UserNotFound, TemporaryFailure, UnknownFailure, Blacklisted, UncertainDueToCatchAll, InvalidFormat, NoMxRecord
+        Valid, UserNotFound, TemporaryFailure, UnknownFailure, Blacklisted,
+        UncertainDueToCatchAll, InvalidFormat, NoMxRecord
     }
 
     public static class ValidationResult {
@@ -55,21 +44,7 @@ public class SmtpRcptValidator {
         private final String fullTranscript;
         private final String timestamp;
         private final String diagnosticTag;
-
-        public boolean isTlsSupported() {
-            return tlsSupported;
-        }
-
-        public boolean isCatchAllDomain() {
-            return isCatchAllDomain;
-        }
-
         private final boolean tlsSupported;
-
-        public int getPortUsed() {
-            return portUsed;
-        }
-
         private final int portUsed;
         private final boolean isCatchAllDomain;
 
@@ -98,15 +73,20 @@ public class SmtpRcptValidator {
         public String getFullTranscript() { return fullTranscript; }
         public String getTimestamp() { return timestamp; }
         public String getDiagnosticTag() { return diagnosticTag; }
+        public boolean isTlsSupported() { return tlsSupported; }
+        public int getPortUsed() { return portUsed; }
+        public boolean isCatchAllDomain() { return isCatchAllDomain; }
     }
 
+    /**
+     * Validate recipient email using parallel checks on multiple SMTP ports.
+     */
     public ValidationResult validateRecipient(String email) throws IOException {
         if (email == null || !email.contains("@")) {
             return new ValidationResult(SmtpRecipientStatus.InvalidFormat, -1, null,
                     "Invalid email format", null, "", LocalDateTime.now().toString(),
                     "InvalidFormat", false, -1, false);
         }
-
         String domain = email.substring(email.indexOf('@') + 1);
 
         String mxHost;
@@ -116,19 +96,36 @@ public class SmtpRcptValidator {
             inetAddress = InetAddress.getByName(mxHost);
             logger.info("Resolved MX host {} to IP {}", mxHost, inetAddress.getHostAddress());
         } catch (IOException e) {
+            logger.warn("MX lookup failed for domain {}: {}", domain, e.getMessage());
             return new ValidationResult(SmtpRecipientStatus.NoMxRecord, -1, null,
                     "MX lookup failed: " + e.getMessage(), domain, "", LocalDateTime.now().toString(),
                     "NoMxRecord", false, -1, false);
         }
 
-        ParallelPortChecker portChecker = new ParallelPortChecker(SMTP_PORTS, port -> attemptValidation(inetAddress, mxHost, email, port));
+        ParallelPortChecker portChecker = new ParallelPortChecker(SMTP_PORTS,
+                port -> attemptValidation(inetAddress, mxHost, email, port));
+
         try {
             return portChecker.checkAllPorts();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            logger.error("Validation interrupted for email {}", email, e);
             return new ValidationResult(SmtpRecipientStatus.UnknownFailure, -1, "Validation interrupted",
                     "Interrupted", mxHost, "", LocalDateTime.now().toString(),
                     "Interrupted", false, -1, false);
+        }
+    }
+
+    /**
+     * Catch-all detection helper method used in your service layer.
+     */
+    public boolean checkSmtpCatchAllSingleSession(String mxHost, String testEmail, String domain) {
+        try {
+            ValidationResult result = validateRecipient(testEmail);
+            return result != null && result.getStatus() == SmtpRecipientStatus.Valid;
+        } catch (IOException e) {
+            logger.warn("Exception during catch-all check for email {}: {}", testEmail, e.getMessage());
+            return false;
         }
     }
 
@@ -180,7 +177,7 @@ public class SmtpRcptValidator {
                             PrintWriter tlsWriter = new PrintWriter(tlsSocket.getOutputStream(), true)
                     ) {
                         tlsSocket.setEnabledProtocols(tlsSocket.getSupportedProtocols());
-                        tlsSocket.setSoTimeout(TIMEOUT_MS);
+                        tlsSocket.setSoTimeout(READ_TIMEOUT_MS);
 
                         transcript.append("<< TLS handshake successful\n");
 
@@ -217,6 +214,7 @@ public class SmtpRcptValidator {
                     transcript.toString().trim(), timestamp, tag, tlsSupported || implicitTls, port, false);
 
         } catch (IOException e) {
+            logger.warn("IOException during SMTP validation on {}:{} - {}", mxHost, port, e.getMessage());
             throw e;
         }
     }
@@ -226,14 +224,14 @@ public class SmtpRcptValidator {
             SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
             SSLSocket socket = (SSLSocket) factory.createSocket(inetAddress, port);
             socket.setEnabledProtocols(socket.getSupportedProtocols());
-            socket.setSoTimeout(TIMEOUT_MS);
+            socket.setSoTimeout(READ_TIMEOUT_MS);
             return socket;
         } else {
             Socket socket = new Socket();
             socket.setReuseAddress(true);
             socket.setKeepAlive(true);
-            socket.connect(new InetSocketAddress(inetAddress, port), TIMEOUT_MS);
-            socket.setSoTimeout(TIMEOUT_MS);
+            socket.connect(new InetSocketAddress(inetAddress, port), CONNECT_TIMEOUT_MS);
+            socket.setSoTimeout(READ_TIMEOUT_MS);
             return socket;
         }
     }

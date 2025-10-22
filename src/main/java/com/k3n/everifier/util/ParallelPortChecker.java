@@ -3,6 +3,7 @@ package com.k3n.everifier.util;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.*;
@@ -14,6 +15,7 @@ public class ParallelPortChecker {
 
     private final int[] ports;
     private final ParallelPortCheckTask task;
+    private static final int THREAD_POOL_SIZE = 5;  // max number of threads
 
     public interface ParallelPortCheckTask {
         SmtpRcptValidator.ValidationResult validatePort(int port) throws Exception;
@@ -22,106 +24,97 @@ public class ParallelPortChecker {
     public ParallelPortChecker(int[] ports, ParallelPortCheckTask task) {
         this.ports = ports;
         this.task = task;
-        logger.debug("ParallelPortChecker initialized with ports: {}", arrayToString(ports));
+        logger.debug("[Init] ParallelPortChecker initialized with ports: {}", Arrays.toString(ports));
     }
 
     public SmtpRcptValidator.ValidationResult checkAllPorts() throws InterruptedException {
-        logger.debug("Starting parallel port checks...");
+        logger.info("[Start] Starting parallel port checks for ports: {}", Arrays.toString(ports));
 
-        ExecutorService executor = Executors.newFixedThreadPool(ports.length);
+        // Limit thread pool size max to THREAD_POOL_SIZE for resource control
+        ExecutorService executor = Executors.newFixedThreadPool(Math.min(ports.length, THREAD_POOL_SIZE));
 
-        Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
-            @Override
-            public void run() {
-                logger.debug("JVM shutdown hook triggered, shutting down executor");
-                executor.shutdown();
-            }
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            logger.warn("[ShutdownHook] JVM shutdown triggered - shutting down executor");
+            executor.shutdown();
         }));
 
         List<Future<SmtpRcptValidator.ValidationResult>> futures = Arrays.stream(ports)
-                .mapToObj(new java.util.function.IntFunction<Future<SmtpRcptValidator.ValidationResult>>() {
-                    @Override
-                    public Future<SmtpRcptValidator.ValidationResult> apply(final int port) {
-                        return executor.submit(new Callable<SmtpRcptValidator.ValidationResult>() {
-                            @Override
-                            public SmtpRcptValidator.ValidationResult call() throws Exception {
-                                logger.debug("Starting validation on port {}", port);
-                                try {
-                                    SmtpRcptValidator.ValidationResult result = task.validatePort(port);
-                                    logger.debug("Validation on port {} completed with status {}", port, result.getStatus());
-                                    return result;
-                                } catch (Exception e) {
-                                    logger.warn("Validation on port {} failed: {}", port, e.getMessage());
-                                    return new SmtpRcptValidator.ValidationResult(
-                                            SmtpRcptValidator.SmtpRecipientStatus.UnknownFailure,
-                                            -1, e.getMessage(),
-                                            "Port validation failed", null, "",
-                                            java.time.LocalDateTime.now().toString(),
-                                            "PortFailed", false, port, false);
-                                }
-                            }
-                        });
+                .mapToObj(port -> executor.submit(() -> {
+                    String threadName = Thread.currentThread().getName();
+                    logger.trace("[{}] Validating port {}...", threadName, port);
+                    try {
+                        SmtpRcptValidator.ValidationResult result = task.validatePort(port);
+                        logger.debug("[{}] Port {} validation completed with status {}", threadName, port, result.getStatus());
+                        return result;
+                    } catch (Exception e) {
+                        logger.warn("[{}] Port {} validation failed: {}", threadName, port, e.getMessage());
+                        return new SmtpRcptValidator.ValidationResult(
+                                SmtpRcptValidator.SmtpRecipientStatus.UnknownFailure,
+                                -1, e.getMessage(),
+                                "Port validation failed", null, "",
+                                LocalDateTime.now().toString(),
+                                "PortFailed", false, port, false);
                     }
-                }).collect(Collectors.toList());
+                })).collect(Collectors.toList());
 
         SmtpRcptValidator.ValidationResult validResult = null;
+
         for (Future<SmtpRcptValidator.ValidationResult> future : futures) {
             try {
-                SmtpRcptValidator.ValidationResult res = future.get();
-                logger.debug("Received validation result with status {} on port {}", res.getStatus(), res.getPortUsed());
+                // Wait max 15 seconds for each port validation
+                SmtpRcptValidator.ValidationResult res = future.get(15, TimeUnit.SECONDS);
+                logger.trace("[Future] Received result for port {}: {}", res.getPortUsed(), res.getStatus());
                 if (res.getStatus() == SmtpRcptValidator.SmtpRecipientStatus.Valid) {
-                    logger.info("Valid email found on port {}", res.getPortUsed());
+                    logger.info("[Success] Valid email found on port {}", res.getPortUsed());
                     validResult = res;
                     break;
                 }
-            } catch (Exception e) {
-                logger.warn("Exception while waiting for port validation future: {}", e.getMessage());
+            } catch (TimeoutException e) {
+                logger.warn("[Timeout] Port validation timed out: {}", e.getMessage());
+            } catch (ExecutionException e) {
+                logger.error("[ExecutionError] Exception during port validation result retrieval", e.getCause());
+            } catch (InterruptedException e) {
+                logger.error("[Interrupted] Thread interrupted while waiting for port validation", e);
+                Thread.currentThread().interrupt();
+                throw e;
             }
         }
 
-        for (Future<SmtpRcptValidator.ValidationResult> future : futures) {
+        // Cancel unfinished tasks once a valid result is found or after processing all futures
+        futures.forEach(future -> {
             if (!future.isDone()) {
-                logger.debug("Cancelling port validation task on future");
+                logger.trace("[Cancel] Canceling incomplete validation task");
                 future.cancel(true);
             }
-        }
+        });
 
         executor.shutdownNow();
-        logger.debug("Executor shutdown initiated");
+        logger.debug("[Executor] Executor service shutdown initiated");
 
         if (validResult != null) {
-            logger.debug("Returning first valid result from parallel port checks");
+            logger.debug("[Result] Returning first valid result");
             return validResult;
         }
 
+        // If no valid result, return first available failed completed task
         for (Future<SmtpRcptValidator.ValidationResult> future : futures) {
             if (future.isDone() && !future.isCancelled()) {
                 try {
                     SmtpRcptValidator.ValidationResult res = future.get();
-                    logger.debug("Returning failed validation result with status {} on port {}", res.getStatus(), res.getPortUsed());
+                    logger.debug("[Result] Returning failed port validation result with status {} on port {}", res.getStatus(), res.getPortUsed());
                     return res;
                 } catch (Exception e) {
-                    logger.warn("Exception while retrieving failed validation result: {}", e.getMessage());
+                    logger.warn("[ResultRetrievalError] Unable to retrieve failed validation result: {}", e.getMessage());
                 }
             }
         }
 
-        logger.warn("All ports failed to validate");
+        logger.warn("[Fail] All ports failed validation");
         return new SmtpRcptValidator.ValidationResult(
                 SmtpRcptValidator.SmtpRecipientStatus.UnknownFailure,
                 -1, "All ports failed",
                 "No successful validation", null, "",
-                java.time.LocalDateTime.now().toString(),
+                LocalDateTime.now().toString(),
                 "AllPortsFailed", false, -1, false);
-    }
-
-    private String arrayToString(int[] array) {
-        StringBuilder sb = new StringBuilder("[");
-        for (int i = 0; i < array.length; i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(array[i]);
-        }
-        sb.append("]");
-        return sb.toString();
     }
 }

@@ -1,17 +1,17 @@
-# Use an official OpenJDK 8 runtime as a parent image
+# Use an official OpenJDK 8 runtime as base image
 FROM openjdk:8-jdk-alpine
 
-# Set working directory in the container
+# Set working directory
 WORKDIR /app
 
-# Copy the executable jar file from the build context (target directory) to the container
+# Copy Spring Boot executable jar file
 COPY target/everifier-0.0.1-SNAPSHOT.jar app.jar
 
-# Expose the port the application listens on
+# (Optional) Copy logback configuration file separately, if not packaged inside jar
+# COPY src/main/resources/logback-spring.xml ./config/logback-spring.xml
+
+# Expose application port
 EXPOSE 8081
 
-# Make sure the jar is executable (optional since java -jar executes the jar)
-# RUN chmod +x app.jar
-
-# Run the jar file
-ENTRYPOINT ["java", "-jar", "app.jar"]
+# Run the jar with explicit logback configuration path if copied separately
+ENTRYPOINT ["java", "-Dlogging.config=./config/logback-spring.xml", "-jar", "app.jar"]
