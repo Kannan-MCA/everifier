@@ -29,8 +29,8 @@ public class MXLookupService {
 
     private static final Logger logger = LoggerFactory.getLogger(MXLookupService.class);
 
-    private static final Pattern EMAIL_PATTERN =
-            Pattern.compile("^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern EMAIL_PATTERN = Pattern.compile(
+            "^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$", Pattern.CASE_INSENSITIVE);
 
     private final Set<String> disposableDomains;
     private final Set<String> blacklistDomains;
@@ -50,7 +50,8 @@ public class MXLookupService {
 
     @Async("taskExecutor")
     public CompletableFuture<EmailValidationResult> categorizeEmailAsync(String email) {
-        return CompletableFuture.completedFuture(categorizeEmail(email));
+        EmailValidationResult result = categorizeEmail(email);
+        return CompletableFuture.completedFuture(result);
     }
 
     public EmailValidationResult categorizeEmail(final String email) {
@@ -79,12 +80,10 @@ public class MXLookupService {
             result.setCategory("Whitelisted");
             return result;
         }
-
         if (isDisposableDomain(domain)) {
             result.setCategory("Disposable");
             return result;
         }
-
         if (isBlacklistedDomain(domain)) {
             result.setCategory("Blacklisted");
             return result;
@@ -104,8 +103,20 @@ public class MXLookupService {
             return result;
         }
 
-        ValidationResult smtp = smtpCheckStatusWithRetry(mxRecords, email, 2);
+        try {
+            if (isCatchAll(mxRecords, domain)) {
+                result.setCategory("Catch-All");
+                result.setCatchAll(true);
+                return result;
+            }
+        } catch (IOException e) {
+            logger.warn("Catch-All detection failed for domain {}: {}", domain, e.getMessage());
+            result.setCategory("Unknown");
+            result.setErrors("Catch-All detection error: " + e.getMessage());
+            return result;
+        }
 
+        ValidationResult smtp = smtpCheckStatusWithRetry(mxRecords, email, 2);
         if (smtp == null) {
             result.setCategory("Unknown");
             result.setErrors("SMTP validation returned no result");
@@ -119,22 +130,6 @@ public class MXLookupService {
             return result;
         }
 
-        boolean isCatchAll = false;
-        try {
-            isCatchAll = isCatchAll(mxRecords, domain);
-        } catch (IOException e) {
-            logger.warn("Catch-All detection failed for domain {}: {}", domain, e.getMessage());
-            result.setCategory("Unknown");
-            result.setErrors("Catch-All detection error: " + e.getMessage());
-            return result;
-        }
-
-        if (isCatchAll) {
-            result.setCategory("Catch-All");
-            result.setCatchAll(true);
-            return result;
-        }
-
         result.setDiagnosticTag(smtp.getDiagnosticTag());
         result.setSmtpCode(smtp.getSmtpCode());
         result.setStatus(smtp.getStatus() != null ? smtp.getStatus().name() : null);
@@ -142,43 +137,71 @@ public class MXLookupService {
         result.setMailHost(smtp.getMxHost());
         result.setTimestamp(smtp.getTimestamp());
         result.setPortOpened(true);
-        result.setConnectionSuccessful(smtp.getStatus() != null && !smtp.getStatus().equals(SmtpRecipientStatus.UnknownFailure));
-
+        result.setConnectionSuccessful(
+                smtp.getStatus() != null && !smtp.getStatus().equals(SmtpRecipientStatus.UnknownFailure)
+        );
         if (smtp.getErrorMessage() != null) {
             result.setErrors(smtp.getErrorMessage());
         }
 
         String tag = smtp.getDiagnosticTag() != null ? smtp.getDiagnosticTag().trim() : "";
         switch (tag) {
-            case "Accepted": result.setCategory("Valid"); break;
-            case "Forwarded": result.setCategory("Forwarded"); break;
-            case "CannotVerify": result.setCategory("CannotVerify"); break;
-            case "MailboxBusy": result.setCategory("MailboxBusy"); break;
-            case "LocalError": result.setCategory("LocalError"); break;
-            case "InsufficientStorage": result.setCategory("InsufficientStorage"); break;
+            case "Accepted":
+                result.setCategory("Valid");
+                break;
+            case "Forwarded":
+                result.setCategory("Forwarded");
+                break;
+            case "CannotVerify":
+                result.setCategory("CannotVerify");
+                break;
+            case "MailboxBusy":
+                result.setCategory("MailboxBusy");
+                break;
+            case "LocalError":
+                result.setCategory("LocalError");
+                break;
+            case "InsufficientStorage":
+                result.setCategory("InsufficientStorage");
+                break;
             case "MailboxNotFound":
             case "UserNotLocal":
             case "MailboxNameInvalid":
-                result.setCategory("UserNotFound"); break;
-            case "RelayDenied": result.setCategory("RelayDenied"); break;
-            case "AccessDenied": result.setCategory("AccessDenied"); break;
-            case "Greylisted": result.setCategory("Greylisted"); break;
-            case "SyntaxError": result.setCategory("SyntaxError"); break;
-            case "TransactionFailed": result.setCategory("Invalid"); break;
-            case "BlockedByBlacklist": result.setCategory("Blacklisted"); break;
+                result.setCategory("UserNotFound");
+                break;
+            case "RelayDenied":
+                result.setCategory("RelayDenied");
+                break;
+            case "AccessDenied":
+                result.setCategory("AccessDenied");
+                break;
+            case "Greylisted":
+                result.setCategory("Greylisted");
+                break;
+            case "SyntaxError":
+                result.setCategory("SyntaxError");
+                break;
+            case "TransactionFailed":
+                result.setCategory("Invalid");
+                break;
+            case "BlockedByBlacklist":
+                result.setCategory("Blacklisted");
+                break;
             default:
-                result.setCategory(smtp.getStatus() == SmtpRecipientStatus.TemporaryFailure ? "Unknown" : "Invalid");
+                result.setCategory(
+                        smtp.getStatus() == SmtpRecipientStatus.TemporaryFailure ? "Unknown" : "Invalid"
+                );
         }
-
         return result;
     }
 
     private ValidationResult smtpCheckStatusWithRetry(final List<String> mxRecords, final String email, int maxRetries) {
         int attempt = 0;
         ValidationResult result = null;
+        String mxHost = extractMxHost(mxRecords.get(0));
         while (attempt < maxRetries) {
             try {
-                result = smtpRcptValidator.validateRecipient(email);
+                result = smtpRcptValidator.validateRecipient(mxHost, email);
                 if (result != null && result.getStatus() != SmtpRecipientStatus.TemporaryFailure) {
                     return result;
                 }
@@ -187,11 +210,8 @@ public class MXLookupService {
             }
             attempt++;
             try {
-                Thread.sleep(1000L * attempt);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                break;
-            }
+                Thread.sleep(1000 * attempt);
+            } catch (InterruptedException ignored) { }
         }
         return result;
     }
@@ -206,8 +226,10 @@ public class MXLookupService {
         if (atIndex < 0 || atIndex == email.length() - 1) return null;
         String domain = email.substring(atIndex + 1).toLowerCase(Locale.ROOT);
         try {
-            domain = java.net.IDN.toASCII(domain);
-        } catch (Exception ignored) { }
+            domain = IDN.toASCII(domain);
+        } catch (Exception ex) {
+            // ignore fallback
+        }
         return domain;
     }
 
@@ -224,17 +246,16 @@ public class MXLookupService {
     }
 
     public List<String> getMXRecords(final String domain) throws NamingException {
-        Hashtable<String, String> env = new Hashtable<>();
+        final Hashtable<String, String> env = new Hashtable<>();
         env.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.dns.DnsContextFactory");
-        DirContext ctx = new InitialDirContext(env);
+        final DirContext ctx = new InitialDirContext(env);
 
-        Attributes attrs = ctx.getAttributes(domain, new String[]{"MX"});
-        Attribute attr = attrs.get("MX");
+        final Attributes attrs = ctx.getAttributes(domain, new String[]{"MX"});
+        final Attribute attr = attrs.get("MX");
 
         if (attr == null || attr.size() == 0) {
-            // fallback to A record
-            Attributes aAttrs = ctx.getAttributes(domain, new String[]{"A"});
-            Attribute aAttr = aAttrs.get("A");
+            final Attributes aAttrs = ctx.getAttributes(domain, new String[]{"A"});
+            final Attribute aAttr = aAttrs.get("A");
 
             if (aAttr == null || aAttr.size() == 0) return Collections.emptyList();
 
@@ -245,7 +266,8 @@ public class MXLookupService {
                         } catch (NamingException e) {
                             throw new RuntimeException(e);
                         }
-                    }).collect(Collectors.toList());
+                    })
+                    .collect(Collectors.toList());
         }
 
         return IntStream.range(0, attr.size())
@@ -262,7 +284,7 @@ public class MXLookupService {
     }
 
     private int parsePriority(final String mxRecord) {
-        String[] parts = mxRecord.split("\\s+");
+        final String[] parts = mxRecord.split("\\s+");
         try {
             return Integer.parseInt(parts[0]);
         } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
@@ -272,42 +294,12 @@ public class MXLookupService {
 
     public boolean isCatchAll(final List<String> mxRecords, final String domain) throws IOException {
         if (mxRecords == null || mxRecords.isEmpty()) return false;
-
-        int lowestPriority = mxRecords.stream()
-                .mapToInt(this::parsePriority)
-                .min().orElse(Integer.MAX_VALUE);
-
-        List<String> lowestPriorityMxRecords = mxRecords.stream()
-                .filter(mx -> parsePriority(mx) == lowestPriority)
-                .collect(Collectors.toList());
-
-        for (String mxRecord : lowestPriorityMxRecords) {
-            String mxHost = extractMxHost(mxRecord);
-
-            int acceptedCount = 0;
-            int testCount = 5;
-
-            for (int i = 0; i < testCount; i++) {
-                String testEmail = generateRandomEmail(domain);
-                if (smtpRcptValidator.checkSmtpCatchAllSingleSession(mxHost, testEmail, domain)) {
-                    acceptedCount++;
-                }
-            }
-
-            if (acceptedCount < testCount) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private String generateRandomEmail(String domain) {
-        String randomStr = UUID.randomUUID().toString().replace("-", "");
-        return randomStr + "@" + domain;
+        final String mxHost = extractMxHost(mxRecords.get(0));
+        return smtpRcptValidator.checkSmtpCatchAllSingleSession(mxHost, "nonexistent@" + domain, domain);
     }
 
     private String extractMxHost(final String mxRecord) {
-        String[] parts = mxRecord.split("\\s+");
+        final String[] parts = mxRecord.split("\\s+");
         String host = parts.length >= 2 ? parts[1] : mxRecord;
         return host.endsWith(".") ? host.substring(0, host.length() - 1) : host;
     }
