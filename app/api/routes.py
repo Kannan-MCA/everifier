@@ -1,174 +1,223 @@
-import os
-import io
-import asyncio
-import logging
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File
+from sqlalchemy.orm import Session
 from typing import List
-
-
-import dns.resolver
 import pandas as pd
-from validate_email import validate_email as ve_validate_email
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Body
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, EmailStr, ValidationError
-from dotenv import load_dotenv
+import io
+
+from ..database import get_db
+from ..schemas import (
+    EmailValidationRequest,
+    EmailValidationResponse,
+    BulkEmailValidationRequest,
+    BulkEmailValidationResponse
+)
+from ..services.validator import EmailValidatorService
+from ..models import EmailValidation
+
+router = APIRouter(prefix="/api/v1", tags=["Email Validation"])
+
+validator_service = EmailValidatorService()
 
 
-# Load environment variables
-load_dotenv()
-
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(level=LOG_LEVEL)
-logger = logging.getLogger(__name__)
-
-
-router = APIRouter()
-
-
-# Pydantic Models
-class MXResult(BaseModel):
-    mx_host: str
-
-
-class EmailValidationResponse(BaseModel):
-    email: str
-    status: str  # valid, invalid, user-notfound, catchall, blocklisted
-
-
-# Email syntax model for validation
-class EmailModel(BaseModel):
-    email: EmailStr
-
-
-# MX record resolution
-async def resolve_mx(domain: str) -> List[str]:
-    try:
-        answers = dns.resolver.resolve(domain, 'MX')
-        return [str(r.exchange).rstrip('.') for r in sorted(answers, key=lambda r: r.preference)]
-    except Exception as e:
-        logger.warning(f"MX resolution failed for {domain}: {e}")
-        return []
-
-
-# Email syntax check using Pydantic model
-def is_valid_syntax(email: str) -> bool:
-    try:
-        EmailModel(email=email)
-        return True
-    except ValidationError:
-        return False
-
-
-# Stub for blocklist detection - needs your logic or third party integration
-def is_blocklisted(email: str) -> bool:
-    # Implement your blocklist check here, e.g. domain or full email matching
-    return False
-
-
-# Stub for catchall detection - requires SMTP probe or heuristics; here just false
-def is_catchall(domain: str) -> bool:
-    # Implement your catchall detection logic if possible, else return False
-    return False
-
-
-# Main validation function with SMTP RCPT TO probing using validate_email library
-async def validate_email(email: str) -> dict:
-    if not is_valid_syntax(email):
-        return {
-            "email": email,
-            "status": "invalid",
-        }
-
-    if is_blocklisted(email):
-        return {
-            "email": email,
-            "status": "blocklisted",
-        }
-
-    domain = email.split('@')[-1]
-    mx_records = await resolve_mx(domain)
-
-    if not mx_records:
-        return {
-            "email": email,
-            "status": "invalid",
-        }
-
-    # Use validate_email library to verify domain, mailbox existence with SMTP RCPT TO check
-    try:
-        is_valid = ve_validate_email(
-            email_address=email,
-            check_regex=True,
-            check_mx=True,
-            verify=True,  # Enables SMTP RCPT TO verification
-            smtp_timeout=10,
-            dns_timeout=10,
-        )
-    except Exception as e:
-        logger.warning(f"validate_email SMTP exception for {email}: {e}")
-        is_valid = False
-
-    if not is_valid:
-        # Here assuming user-notfound if MX exists but validation fails
-        return {
-            "email": email,
-            "status": "user-notfound",
-        }
-
-    # Check catchall heuristics if implemented
-    if is_catchall(domain):
-        return {
-            "email": email,
-            "status": "catchall",
-        }
-
-    return {
-        "email": email,
-        "status": "valid",
-    }
-
-
-# Routes
 @router.post("/validate", response_model=EmailValidationResponse)
-async def validate_single(email: str = Form(...)):
-    try:
-        result = await validate_email(email)
-        return result
-    except Exception as e:
-        logger.exception("Validation failed")
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/validate-batch", response_model=List[EmailValidationResponse])
-async def validate_batch(emails: List[str] = Body(...)):
-    tasks = [validate_email(email) for email in emails]
-    results = await asyncio.gather(*tasks)
-    return results
-
-
-@router.post("/validate-csv")
-async def validate_csv(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
-
-        if "email" not in df.columns:
-            return JSONResponse(content={"error": "CSV must contain an 'email' column"}, status_code=400)
-
-        tasks = [validate_email(email) for email in df["email"]]
-        results = await asyncio.gather(*tasks)
-        df_out = pd.DataFrame(results)
-
-        output = io.StringIO()
-        df_out.to_csv(output, index=False)
-        output.seek(0)
-
-        return StreamingResponse(
-            output,
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=validation_results.csv"},
+async def validate_single_email(
+    request: EmailValidationRequest,
+    db: Session = Depends(get_db)
+):
+    """Validate a single email address"""
+    
+    # Check if email already validated in database
+    existing = db.query(EmailValidation).filter(
+        EmailValidation.email == request.email.lower()
+    ).first()
+    
+    if existing:
+        return EmailValidationResponse(
+            email=existing.email,
+            status=existing.status,
+            reason=existing.reason,
+            mx_records=existing.mx_records.split(", ") if existing.mx_records else None,
+            smtp_response=existing.smtp_response,
+            validated_at=existing.validated_at
         )
-    except Exception as e:
-        logger.exception("CSV validation failed")
-        return JSONResponse(content={"error": str(e)}, status_code=400)
+    
+    # Perform validation
+    result = validator_service.validate_email(request.email)
+    
+    # Save to database
+    validation_record = EmailValidation(
+        email=result['email'],
+        status=result['status'].value,
+        reason=result['reason'],
+        mx_records=", ".join(result['mx_records']) if result['mx_records'] else None,
+        smtp_response=result['smtp_response'],
+        validated_at=result['validated_at']
+    )
+    db.add(validation_record)
+    db.commit()
+    db.refresh(validation_record)
+    
+    return EmailValidationResponse(
+        email=result['email'],
+        status=result['status'],
+        reason=result['reason'],
+        mx_records=result['mx_records'],
+        smtp_response=result['smtp_response'],
+        validated_at=result['validated_at']
+    )
+
+
+@router.post("/validate/bulk", response_model=BulkEmailValidationResponse)
+async def validate_bulk_emails(
+    request: BulkEmailValidationRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """Validate multiple email addresses"""
+    
+    results = []
+    
+    for email in request.emails:
+        email_lower = email.lower()
+        
+        # Check cache in database
+        existing = db.query(EmailValidation).filter(
+            EmailValidation.email == email_lower
+        ).first()
+        
+        if existing:
+            results.append(EmailValidationResponse(
+                email=existing.email,
+                status=existing.status,
+                reason=existing.reason,
+                mx_records=existing.mx_records.split(", ") if existing.mx_records else None,
+                smtp_response=existing.smtp_response,
+                validated_at=existing.validated_at
+            ))
+        else:
+            # Perform validation
+            result = validator_service.validate_email(email)
+            
+            # Save to database
+            validation_record = EmailValidation(
+                email=result['email'],
+                status=result['status'].value,
+                reason=result['reason'],
+                mx_records=", ".join(result['mx_records']) if result['mx_records'] else None,
+                smtp_response=result['smtp_response'],
+                validated_at=result['validated_at']
+            )
+            db.add(validation_record)
+            
+            results.append(EmailValidationResponse(
+                email=result['email'],
+                status=result['status'],
+                reason=result['reason'],
+                mx_records=result['mx_records'],
+                smtp_response=result['smtp_response'],
+                validated_at=result['validated_at']
+            ))
+    
+    db.commit()
+    
+    return BulkEmailValidationResponse(
+        total=len(results),
+        results=results
+    )
+
+
+@router.post("/validate/upload", response_model=BulkEmailValidationResponse)
+async def validate_from_csv(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """Validate emails from CSV file upload"""
+    
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Only CSV files are accepted")
+    
+    # Read CSV
+    contents = await file.read()
+    df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+    
+    if 'email' not in df.columns:
+        raise HTTPException(status_code=400, detail="CSV must contain 'email' column")
+    
+    emails = df['email'].dropna().tolist()
+    
+    if len(emails) > 1000:
+        raise HTTPException(status_code=400, detail="Maximum 1000 emails per upload")
+    
+    results = []
+    
+    for email in emails:
+        try:
+            email_lower = str(email).lower().strip()
+            
+            # Check database cache
+            existing = db.query(EmailValidation).filter(
+                EmailValidation.email == email_lower
+            ).first()
+            
+            if existing:
+                results.append(EmailValidationResponse(
+                    email=existing.email,
+                    status=existing.status,
+                    reason=existing.reason,
+                    mx_records=existing.mx_records.split(", ") if existing.mx_records else None,
+                    smtp_response=existing.smtp_response,
+                    validated_at=existing.validated_at
+                ))
+            else:
+                # Perform validation
+                result = validator_service.validate_email(email_lower)
+                
+                # Save to database
+                validation_record = EmailValidation(
+                    email=result['email'],
+                    status=result['status'].value,
+                    reason=result['reason'],
+                    mx_records=", ".join(result['mx_records']) if result['mx_records'] else None,
+                    smtp_response=result['smtp_response'],
+                    validated_at=result['validated_at']
+                )
+                db.add(validation_record)
+                
+                results.append(EmailValidationResponse(
+                    email=result['email'],
+                    status=result['status'],
+                    reason=result['reason'],
+                    mx_records=result['mx_records'],
+                    smtp_response=result['smtp_response'],
+                    validated_at=result['validated_at']
+                ))
+        except Exception as e:
+            continue
+    
+    db.commit()
+    
+    return BulkEmailValidationResponse(
+        total=len(results),
+        results=results
+    )
+
+
+@router.get("/history/{email}", response_model=EmailValidationResponse)
+async def get_validation_history(email: str, db: Session = Depends(get_db)):
+    """Get validation history for a specific email"""
+    
+    record = db.query(EmailValidation).filter(
+        EmailValidation.email == email.lower()
+    ).first()
+    
+    if not record:
+        raise HTTPException(status_code=404, detail="Email not found in validation history")
+    
+    return EmailValidationResponse(
+        email=record.email,
+        status=record.status,
+        reason=record.reason,
+        mx_records=record.mx_records.split(", ") if record.mx_records else None,
+        smtp_response=record.smtp_response,
+        validated_at=record.validated_at
+    )
