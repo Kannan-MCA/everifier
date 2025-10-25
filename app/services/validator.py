@@ -130,7 +130,7 @@ class EmailValidatorService:
         smtp = None
         try:
             # Connect with timeout
-            smtp = smtplib.SMTP(timeout=10)
+            smtp = smtplib.SMTP(timeout=30)
             smtp.connect(mx_host, 25)
             
             # EHLO

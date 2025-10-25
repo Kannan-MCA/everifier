@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 import os
-from .app.models import Base
+from app.models import Base
 
 load_dotenv()
 
