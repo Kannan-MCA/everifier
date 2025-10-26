@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from dotenv import load_dotenv
 import os
 from app.models import Base
@@ -17,7 +17,7 @@ def reset_database():
     except Exception as e:
         print(f"Warning during drop: {e}")
     
-    # Create all tables with correct schema
+    # Create all tables with updated schema including catchall_checked column
     print("Creating tables with correct schema...")
     Base.metadata.create_all(bind=engine)
     
@@ -30,6 +30,7 @@ def reset_database():
     print("  - mx_records (TEXT)")
     print("  - smtp_response (TEXT)")
     print("  - validated_at (TIMESTAMP)")
+    print("  - catchall_checked (BOOLEAN)")
 
 if __name__ == "__main__":
     reset_database()

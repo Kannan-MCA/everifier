@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text
+from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean
 from sqlalchemy.orm import declarative_base
 from datetime import datetime, UTC
 
@@ -14,6 +14,7 @@ class EmailValidation(Base):
     mx_records = Column(Text)
     smtp_response = Column(Text)
     validated_at = Column(DateTime, default=lambda: datetime.now(UTC))
-    
+    catchall_checked = Column(Boolean, default=False, nullable=False)  # New field to track catch-all detection status
+
     def __repr__(self):
         return f"<EmailValidation(email={self.email}, status={self.status})>"
