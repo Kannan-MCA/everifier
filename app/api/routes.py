@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Request, status, Query
 from sqlalchemy.orm import Session
+from collections import defaultdict
 from typing import List
 import pandas as pd
 import io
@@ -18,7 +19,7 @@ from ..schemas import (
 )
 from ..services.validator import EmailValidatorService
 from ..models import EmailValidation
-from ..services.catchall import CatchAllDetector   # Import CatchAllDetector
+from ..services.catchall import CatchAllDetector  # Import CatchAllDetector
 
 router = APIRouter(prefix="/api/v1", tags=["Email Validation"])
 limiter = Limiter(key_func=get_remote_address)
@@ -34,6 +35,7 @@ async def smtp_verify(mx_host: str, recipient: str):
     )
 
 catchall_detector = CatchAllDetector(smtp_verify_func=smtp_verify)
+
 
 @router.post("/validate", response_model=EmailValidationResponse)
 @limiter.limit("10/minute")
@@ -75,6 +77,7 @@ async def validate_single_email(
         smtp_response=existing.smtp_response,
         validated_at=existing.validated_at
     )
+
 
 @router.post("/validate/bulk", response_model=BulkEmailValidationResponse)
 @limiter.limit("5/minute")
@@ -146,6 +149,7 @@ async def validate_bulk_emails(
         results=results,
         processing_time_ms=round(processing_time, 2)
     )
+
 
 @router.post("/validate/upload", response_model=BulkEmailValidationResponse)
 @limiter.limit("3/minute")
@@ -246,6 +250,7 @@ async def validate_from_csv(
         processing_time_ms=round(processing_time, 2)
     )
 
+
 @router.get("/history/{email}", response_model=EmailValidationResponse)
 async def get_validation_history(email: str, db: Session = Depends(get_db)):
     record = db.query(EmailValidation).filter(
@@ -262,6 +267,7 @@ async def get_validation_history(email: str, db: Session = Depends(get_db)):
         validated_at=record.validated_at
     )
 
+
 @router.post("/reset-db", status_code=status.HTTP_200_OK)
 async def reset_email_validation_db(db: Session = Depends(get_db)):
     try:
@@ -271,22 +277,118 @@ async def reset_email_validation_db(db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to reset database: {str(e)}")
-
-@router.post("/catchall-check")
-@limiter.limit("5/minute")
-async def catchall_check(
+    
+@router.post("/catchall-batch")
+@limiter.limit("3/minute")
+async def batch_catchall_check(
     request: Request,
-    domain: str = Query(..., description="Domain to check catch-all"),
+    db: Session = Depends(get_db),
+    limit: int = 100  # number of rows to fetch at once
 ):
-    # DNS MX lookup using validator_service DNS logic
-    dns_result = await asyncio.to_thread(validator_service._validate_dns_mx, f"user@{domain}")
-    if not dns_result['valid'] or not dns_result['mx_records']:
-        raise HTTPException(status_code=400, detail=f"Invalid domain or no MX records found for {domain}")
-    mx_records = dns_result['mx_records'][:3]
-    # Use CatchAllDetector for on-demand catch-all detection
-    is_catch_all = await catchall_detector.check_catch_all(mx_records, domain)
-    return {
-        "domain": domain,
-        "catch_all": is_catch_all,
-        "mx_records": mx_records
-    }
+    # Step 1: Fetch emails where catchall_checked is False
+    records = (
+        db.query(EmailValidation)
+        .filter(EmailValidation.catchall_checked == False)
+        .limit(limit)
+        .all()
+    )
+    if not records:
+        return {"detail": "No records pending catchall validation."}
+
+    # Step 2: Group emails by domain in Python
+    domain_emails = defaultdict(list)
+    for record in records:
+        # Extract domain from email
+        try:
+            domain = record.email.split('@')[1].lower()
+            domain_emails[domain].append(record.email)
+        except Exception:
+            # Skip malformed emails
+            continue
+
+    results = []
+
+    # Step 3: For each domain, run catchall detection once, update all emails in that domain
+    for domain, emails in domain_emails.items():
+        try:
+            # DNS MX lookup for domain
+            dns_result = await asyncio.to_thread(validator_service._validate_dns_mx, f"user@{domain}")
+            if not dns_result["valid"] or not dns_result["mx_records"]:
+                # Skip updating catchall_checked since domain invalid
+                results.append({
+                    "domain": domain,
+                    "catch_all": None,
+                    "message": "Invalid domain or no MX records"
+                })
+                continue
+
+            mx_records = dns_result["mx_records"][:3]
+            catch_all_flag = await catchall_detector.check_catch_all(mx_records, domain)
+
+            # Update all emails for this domain accordingly
+            if catch_all_flag:
+                db.query(EmailValidation).filter(
+                    EmailValidation.email.in_(emails)
+                ).update(
+                    {"catch_all": True, "catchall_checked": True},
+                    synchronize_session=False
+                )
+                results.append({
+                    "domain": domain,
+                    "catch_all": True,
+                    "message": "Catch-all detected and updated",
+                    "emails_processed": len(emails)
+                })
+            else:
+                db.query(EmailValidation).filter(
+                    EmailValidation.email.in_(emails)
+                ).update(
+                    {"catchall_checked": True},
+                    synchronize_session=False
+                )
+                results.append({
+                    "domain": domain,
+                    "catch_all": False,
+                    "message": "Not catch-all; old result preserved",
+                    "emails_processed": len(emails)
+                })
+
+        except Exception as e:
+            results.append({
+                "domain": domain,
+                "catch_all": None,
+                "error": str(e),
+                "emails_processed": len(emails)
+            })
+
+    db.commit()
+    return {"processed_domains": len(results), "results": results}
+@router.get("/filter-emails", response_model=List[EmailValidationResponse])
+@limiter.limit("10/minute")
+async def filter_emails(
+    request: Request,
+    status: EmailValidationStatus = Query(None, description="Filter by email validation status"),
+    db: Session = Depends(get_db),
+):
+    query = db.query(EmailValidation)
+
+    if status is not None:
+        query = query.filter(EmailValidation.status == status.value)
+
+    if catch_all is not None:
+        query = query.filter(EmailValidation.catch_all == catch_all)
+
+    records = query.all()
+
+    results = []
+    for record in records:
+        results.append(EmailValidationResponse(
+            email=record.email,
+            status=EmailValidationStatus(record.status),
+            reason=record.reason,
+            mx_records=record.mx_records.split(", ") if record.mx_records else None,
+            smtp_response=record.smtp_response,
+            validated_at=record.validated_at
+        ))
+
+    return results
