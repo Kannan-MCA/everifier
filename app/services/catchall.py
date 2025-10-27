@@ -1,29 +1,22 @@
-# app/services/catchall.py
 import asyncio
 import random
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Set
 
 logger = logging.getLogger(__name__)
 
 class CatchAllDetector:
-    """
-    Asynchronous catch-all detection logic.
-    Runs multiple RCPT TO tests per MX host with randomized delays
-    and applies statistical threshold to decide catch-all presence.
-    """
-
     def __init__(
         self,
-        smtp_verify_func,          # Async function(mx_host:str, recipient:str) -> Tuple[int, bytes]
+        smtp_verify_func,
         attempts_per_mx: int = 3,
         positive_threshold: float = 0.8,
-        delay_range: Tuple[float, float] = (0.2, 1.0)
+        delay_range: Tuple[float, float] = (0.2, 1.0),
+        exclude_domains: Set[str] = None  # Default is None, not set directly!
     ):
-        self.smtp_verify = smtp_verify_func
-        self.attempts_per_mx = attempts_per_mx
-        self.positive_threshold = positive_threshold
-        self.delay_range = delay_range
+        if exclude_domains is None:
+            exclude_domains = {"gmail.com", "yahoo.com", "outlook.com"}  # Assign default inside constructor
+        self.exclude_domains = exclude_domains
 
     def generate_fake_email(self, domain: str) -> str:
         """Create a random fake email for catch-all testing."""
@@ -32,11 +25,11 @@ class CatchAllDetector:
         return f"{random_string}@{domain}"
 
     async def check_catch_all(self, mx_hosts: List[str], domain: str) -> bool:
-        """
-        Perform catch-all detection by sending multiple RCPT TO commands
-        with random fake emails to each MX host.
-        Returns True if catch-all likely present based on threshold.
-        """
+       
+        if domain in self.exclude_domains:
+            logger.info(f"Skipping catch-all detection for excluded domain '{domain}'")
+            return False
+
         positive_responses = 0
         total_attempts = len(mx_hosts) * self.attempts_per_mx
 
@@ -58,9 +51,3 @@ class CatchAllDetector:
         logger.info(f"Catch-all detection: {positive_responses}/{total_attempts} positive responses. Ratio={ratio:.2f}")
 
         return ratio >= self.positive_threshold
-
-
-# Example SMTP verification async function signature you must provide from your validator:
-# async def smtp_verify(mx_host: str, recipient: str) -> Tuple[int, bytes]:
-#     ...
-#     return (smtp_code, smtp_message_bytes)

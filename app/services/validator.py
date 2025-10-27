@@ -3,8 +3,6 @@ import asyncio
 import ssl
 import smtplib
 import socket
-import random
-import string
 import time
 import logging
 from typing import Dict, List, Optional, Tuple
@@ -64,8 +62,6 @@ class EmailValidatorService:
             return self._create_result(email, EmailValidationStatus.UNKNOWN, f"SMTP validation skipped for {domain} (port 25 blocked by provider)", mx_records, None)
 
         status, reason, smtp_response = await asyncio.to_thread(self._validate_via_smtp, email, mx_records, domain)
-
-        # Catch-all detection to be handled outside, after initial validation
 
         return self._create_result(email, status, reason, mx_records, smtp_response)
 
@@ -164,20 +160,6 @@ class EmailValidatorService:
                     continue
                 return 0, str(e)
         return 0, "Max retries exceeded"
-
-    async def _detect_catch_all_async(self, mx_hosts: List[str], domain: str, attempts_per_mx: int = 3, positive_threshold: float = 0.8) -> bool:
-        positive_responses = 0
-        total_attempts = len(mx_hosts) * attempts_per_mx
-        for mx_host in mx_hosts:
-            for _ in range(attempts_per_mx):
-                random_local = ''.join(random.choices(string.ascii_lowercase + string.digits, k=15))
-                fake_email = f"{random_local}@{domain}"
-                code, _ = await asyncio.to_thread(self._smtp_check, mx_host, fake_email, 1, 1)
-                if code == 250:
-                    positive_responses += 1
-                await asyncio.sleep(random.uniform(0.2, 1.0))
-        ratio = positive_responses / total_attempts if total_attempts > 0 else 0.0
-        return ratio >= positive_threshold
 
     def _parse_smtp_response(self, code: int, response: str) -> Tuple[EmailValidationStatus, str, str]:
         response_lower = response.lower()

@@ -18,11 +18,22 @@ from ..schemas import (
 )
 from ..services.validator import EmailValidatorService
 from ..models import EmailValidation
+from ..services.catchall import CatchAllDetector   # Import CatchAllDetector
 
 router = APIRouter(prefix="/api/v1", tags=["Email Validation"])
 limiter = Limiter(key_func=get_remote_address)
 validator_service = EmailValidatorService()
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+
+# Prepare CatchAllDetector with your smtp_verify function
+async def smtp_verify(mx_host: str, recipient: str):
+    # Delegate to EmailValidatorService._smtp_check in thread
+    # (returns code, response as tuple)
+    return await asyncio.to_thread(
+        validator_service._smtp_check, mx_host, recipient, 1, 1
+    )
+
+catchall_detector = CatchAllDetector(smtp_verify_func=smtp_verify)
 
 @router.post("/validate", response_model=EmailValidationResponse)
 @limiter.limit("10/minute")
@@ -33,18 +44,15 @@ async def validate_single_email(
 ):
     email = email_request.email.lower()
     existing = db.query(EmailValidation).filter(EmailValidation.email == email).first()
-
     if existing:
-        catchall_checked = getattr(existing, "catchall_checked", False)
-        if existing.status != EmailValidationStatus.VALID.value or catchall_checked:
-            return EmailValidationResponse(
-                email=existing.email,
-                status=EmailValidationStatus(existing.status),
-                reason=existing.reason,
-                mx_records=existing.mx_records.split(", ") if existing.mx_records else None,
-                smtp_response=existing.smtp_response,
-                validated_at=existing.validated_at
-            )
+        return EmailValidationResponse(
+            email=existing.email,
+            status=EmailValidationStatus(existing.status),
+            reason=existing.reason,
+            mx_records=existing.mx_records.split(", ") if existing.mx_records else None,
+            smtp_response=existing.smtp_response,
+            validated_at=existing.validated_at
+        )
     else:
         result = await validator_service.validate_email(email)
         validation_record = EmailValidation(
@@ -53,26 +61,12 @@ async def validate_single_email(
             reason=result['reason'],
             mx_records=", ".join(result['mx_records']) if result['mx_records'] else None,
             smtp_response=result['smtp_response'],
-            validated_at=result['validated_at'],
-            catchall_checked=False
+            validated_at=result['validated_at']
         )
         db.add(validation_record)
         db.commit()
         db.refresh(validation_record)
         existing = validation_record
-
-    if existing.status == EmailValidationStatus.VALID.value and not getattr(existing, "catchall_checked", False):
-        domain = email.split('@')[1]
-        mx_hosts = existing.mx_records.split(", ") if existing.mx_records else []
-        if mx_hosts:
-            is_catch_all = await validator_service._detect_catch_all_async(mx_hosts[:3], domain)
-            if is_catch_all:
-                existing.status = EmailValidationStatus.CATCH_ALL.value
-                existing.reason = "Catch-all detected on-demand"
-            existing.catchall_checked = True
-            db.add(existing)
-            db.commit()
-
     return EmailValidationResponse(
         email=existing.email,
         status=EmailValidationStatus(existing.status),
@@ -125,8 +119,7 @@ async def validate_bulk_emails(
                     reason=result['reason'],
                     mx_records=", ".join(result['mx_records']) if result['mx_records'] else None,
                     smtp_response=result['smtp_response'],
-                    validated_at=result['validated_at'],
-                    catchall_checked=False
+                    validated_at=result['validated_at']
                 )
                 db.add(validation_record)
                 results.append(EmailValidationResponse(
@@ -221,8 +214,7 @@ async def validate_from_csv(
                         reason=result['reason'],
                         mx_records=", ".join(result['mx_records']) if result['mx_records'] else None,
                         smtp_response=result['smtp_response'],
-                        validated_at=result['validated_at'],
-                        catchall_checked=False
+                        validated_at=result['validated_at']
                     )
                     db.add(validation_record)
                     results.append(EmailValidationResponse(
@@ -283,20 +275,18 @@ async def reset_email_validation_db(db: Session = Depends(get_db)):
 @router.post("/catchall-check")
 @limiter.limit("5/minute")
 async def catchall_check(
-    request: Request,                        # <- required by slowapi limiter
+    request: Request,
     domain: str = Query(..., description="Domain to check catch-all"),
-    db: Session = Depends(get_db),
 ):
+    # DNS MX lookup using validator_service DNS logic
     dns_result = await asyncio.to_thread(validator_service._validate_dns_mx, f"user@{domain}")
-    
-    
     if not dns_result['valid'] or not dns_result['mx_records']:
         raise HTTPException(status_code=400, detail=f"Invalid domain or no MX records found for {domain}")
     mx_records = dns_result['mx_records'][:3]
-    is_catch_all = await validator_service._detect_catch_all_async(mx_records, domain)
+    # Use CatchAllDetector for on-demand catch-all detection
+    is_catch_all = await catchall_detector.check_catch_all(mx_records, domain)
     return {
         "domain": domain,
         "catch_all": is_catch_all,
         "mx_records": mx_records
     }
-
