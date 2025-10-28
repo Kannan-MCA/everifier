@@ -9,19 +9,23 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5
 
 def reset_database():
     engine = create_engine(DATABASE_URL, echo=True)
-    
-    # Drop all tables
-    print("Dropping all tables...")
+
     try:
+        print("Dropping all tables...")
         Base.metadata.drop_all(bind=engine)
+        print("All tables dropped successfully.")
     except Exception as e:
         print(f"Warning during drop: {e}")
-    
-    # Create all tables with updated schema including catchall_checked column
-    print("Creating tables with correct schema...")
-    Base.metadata.create_all(bind=engine)
-    
-    print("\n Database reset complete!")
+
+    try:
+        print("Creating tables with correct schema...")
+        Base.metadata.create_all(bind=engine)
+        print("Tables created successfully.")
+    except Exception as e:
+        print(f"Error during table creation: {e}")
+        return
+
+    print("\nDatabase reset complete!")
     print("Table 'email_validations' created with columns:")
     print("  - id (SERIAL PRIMARY KEY)")
     print("  - email (VARCHAR(255))")
@@ -31,6 +35,8 @@ def reset_database():
     print("  - smtp_response (TEXT)")
     print("  - validated_at (TIMESTAMP)")
     print("  - catchall_checked (BOOLEAN)")
+    print("  - catch_all (BOOLEAN, nullable)")
+    print("  - catchall_reason (TEXT, nullable)")
 
 if __name__ == "__main__":
     reset_database()

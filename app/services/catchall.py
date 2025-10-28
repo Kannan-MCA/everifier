@@ -12,20 +12,22 @@ class CatchAllDetector:
         attempts_per_mx: int = 3,
         positive_threshold: float = 0.8,
         delay_range: Tuple[float, float] = (0.2, 1.0),
-        exclude_domains: Set[str] = None  # Default is None, not set directly!
+        exclude_domains: Set[str] = None
     ):
         if exclude_domains is None:
-            exclude_domains = {"gmail.com", "yahoo.com", "outlook.com"}  # Assign default inside constructor
+            exclude_domains = {"gmail.com", "yahoo.com", "outlook.com"}
+        self.smtp_verify = smtp_verify_func
+        self.attempts_per_mx = attempts_per_mx
+        self.positive_threshold = positive_threshold
+        self.delay_range = delay_range
         self.exclude_domains = exclude_domains
 
     def generate_fake_email(self, domain: str) -> str:
-        """Create a random fake email for catch-all testing."""
         from string import ascii_lowercase, digits
         random_string = ''.join(random.choices(ascii_lowercase + digits, k=20))
         return f"{random_string}@{domain}"
 
     async def check_catch_all(self, mx_hosts: List[str], domain: str) -> bool:
-       
         if domain in self.exclude_domains:
             logger.info(f"Skipping catch-all detection for excluded domain '{domain}'")
             return False

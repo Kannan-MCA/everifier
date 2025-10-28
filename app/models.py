@@ -14,7 +14,9 @@ class EmailValidation(Base):
     mx_records = Column(Text)
     smtp_response = Column(Text)
     validated_at = Column(DateTime, default=lambda: datetime.now(UTC))
-    catchall_checked = Column(Boolean, default=False, nullable=False)  # New field to track catch-all detection status
+    catchall_checked = Column(Boolean, default=False, nullable=False)  # Indicates if catch-all was checked
+    catch_all = Column(Boolean, nullable=True, default=None)  # Catch-all status: True/False/None
+    catchall_reason = Column(Text, nullable=True)  # Optional detailed reason/explanation
 
     def __repr__(self):
-        return f"<EmailValidation(email={self.email}, status={self.status})>"
+        return f"<EmailValidation(email={self.email}, status={self.status}, catch_all={self.catch_all})>"

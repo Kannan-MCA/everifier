@@ -5,6 +5,7 @@ import smtplib
 import socket
 import time
 import logging
+import random
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, UTC
 import dns.resolver
@@ -13,6 +14,12 @@ from email_validator import validate_email as validate_email_syntax, EmailNotVal
 from ..schemas import EmailValidationStatus
 
 logger = logging.getLogger(__name__)
+
+FROM_EMAILS = [
+    "emailverification842@verifyapp.syfer25.com",
+    "emailverification848@verifyapp.syfer25.com",
+    "emailverification855@verifyapp.syfer25.com"
+]
 
 class EmailValidatorService:
     EMAIL_PATTERN = re.compile(
@@ -25,10 +32,9 @@ class EmailValidatorService:
     ROLE_BASED_PREFIXES = set()
     SMTP_PORTS = [25, 587, 465]
 
-    def __init__(self, from_email="verify@verifyapp.syfer25.com", helo_hostname="mail.verifyapp.syfer25.com"):
-        self.from_email = from_email
+    def __init__(self, helo_hostname="mail.verifyapp.syfer25.com"):
         self.helo_hostname = helo_hostname
-        logger.info(f"EmailValidatorService initialized with from_email={from_email}")
+        logger.info(f"EmailValidatorService initialized with helo_hostname={helo_hostname}")
 
     async def validate_email(self, email: str) -> Dict:
         logger.info(f"Validating email: {email}")
@@ -59,9 +65,12 @@ class EmailValidatorService:
             return self._create_result(email, EmailValidationStatus.INVALID, "No valid MX records found", None, None)
 
         if domain in self.SKIP_SMTP_DOMAINS:
-            return self._create_result(email, EmailValidationStatus.UNKNOWN, f"SMTP validation skipped for {domain} (port 25 blocked by provider)", mx_records, None)
+            return self._create_result(email, EmailValidationStatus.UNKNOWN,
+                                       f"SMTP validation skipped for {domain} (port 25 blocked by provider)", mx_records, None)
 
         status, reason, smtp_response = await asyncio.to_thread(self._validate_via_smtp, email, mx_records, domain)
+
+        # catch_all detection handled externally by batch process
 
         return self._create_result(email, status, reason, mx_records, smtp_response)
 
@@ -121,6 +130,7 @@ class EmailValidatorService:
         return self._parse_smtp_response(code_real, smtp_response)
 
     def _smtp_check(self, mx_host: str, rcpt_email: str, retry_count: int = 2, delay: int = 3) -> Tuple[int, str]:
+        from_email = random.choice(FROM_EMAILS)
         for attempt in range(retry_count):
             try:
                 with smtplib.SMTP(mx_host, 25, timeout=30) as server:
@@ -135,7 +145,7 @@ class EmailValidatorService:
                         logger.debug("STARTTLS successful")
                     except Exception as e:
                         logger.warning(f"Skipping TLS: {e}")
-                    server.mail(self.from_email)
+                    server.mail(from_email)
                     code, msg = server.rcpt(rcpt_email)
                     msg_str = msg.decode(errors='ignore') if isinstance(msg, bytes) else str(msg)
                     return code, msg_str
