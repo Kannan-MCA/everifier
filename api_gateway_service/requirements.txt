@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic[email]
+sqlalchemy[asyncio]
+asyncpg
+httpx
+python-jose
+slowapi
+dnspython
+aiodns
+email-validator
+psycopg2-binary
