@@ -81,4 +81,4 @@ async def startup_event():
     asyncio.create_task(cleanup_loop())
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8500)
+    uvicorn.run(app, host="0.0.0.0", port=8002)

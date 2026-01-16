@@ -49,9 +49,11 @@ async def verify_token(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, detail="Could not validate credentials")
 
 backend_services = {
-    "syntax_mx": "http://syntax-mx-service:8001",
-    "smtp": "http://smtp-service:8002",
-    "catchall": "http://catchall-service:8003",
+    "syntax_mx": "http://syntax-mx-service:8005",
+    "smtp": "http://smtp-service:8006",
+    "catchall": "http://catchall-service:8007",
+    "discovery": "http://discovery-service:8002",
+    "agent": "http://agent-service:8003",
 }
 
 @app.get("/")
